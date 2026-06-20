@@ -1,0 +1,52 @@
+# Keep the Docker build context small and deterministic.
+#
+# Without this, every build uploads the virtualenv (tens of thousands of files)
+# and the ChromaDB store to the daemon. It is also what makes builds fail
+# outright on synced/OneDrive paths, where reading that many files is slow and
+# error-prone.
+
+# Version control and tooling
+.git
+.gitignore
+.github
+.vscode
+.idea
+
+# Local environment - never belongs in an image
+.venv
+venv
+.env
+.env.local
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pytest_chroma/
+.pytest_tickets/
+
+# Runtime data: derived from data/documents, and the agent writes here at runtime
+chroma_data/
+data/tickets/*.json
+
+# Model weights are downloaded into the image at first use
+models/
+
+# Evaluation output
+eval/results/*.json
+
+# Docs and editor noise
+*.md
+!README.md
+.DS_Store
+Thumbs.db
+*.swp
+
+# The sample knowledge base is fetched or regenerated, not baked in
+data/documents/*.pdf
+
+# Local screenshots / browser profile from UI verification.
+.shots/

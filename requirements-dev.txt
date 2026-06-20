@@ -1,0 +1,10 @@
+# Anchor — local development / CI tooling (not shipped in images).
+-r agent/requirements.txt
+
+pytest>=8.3,<10.0
+pytest-asyncio>=0.24
+ruff>=0.7
+
+# Used by scripts/make_sample_docs.py and scripts/make_pii_sample.py to
+# generate the sample PDFs. Not needed to run the service.
+fpdf2>=2.8

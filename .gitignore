@@ -1,0 +1,40 @@
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Secrets / local config -----------------------------------------------
+.env
+.env.local
+*.pem
+
+# --- Runtime data ----------------------------------------------------------
+# Vector store contents are derived from data/documents and are rebuildable.
+chroma_data/
+.pytest_chroma/
+.pytest_tickets/
+
+# Ingestion outputs; the source documents themselves are tracked.
+data/tickets/*.json
+eval/results/*.json
+
+# --- Model weights ---------------------------------------------------------
+models/
+
+# --- OS / editors ----------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Pre-existing local document, not part of the project.
+Anchor_Technical_Spec.md.pdf
+
+# Local screenshots / browser profile from UI verification.
+.shots/
