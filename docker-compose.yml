@@ -1,0 +1,66 @@
+# Anchor — single-machine deployment.
+#
+#   cp .env.example .env      # then set JWT_SECRET
+#   docker compose up --build
+#
+# `agent` and `ollama` start by default. The batch ingestion worker is behind a
+# compose profile so it stays opt-in:
+#   docker compose --profile batch run --rm ingestion
+
+name: anchor
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: anchor-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  agent:
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    container_name: anchor-agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Inside the compose network the provider lives on the `ollama` service.
+      OLLAMA_BASE_URL: http://ollama:11434
+      CHROMA_PERSIST_DIR: /app/chroma_data
+      TICKETS_DIR: /app/data/tickets
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/app/chroma_data
+      - ./data:/app/data
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+  ingestion:
+    build:
+      context: .
+      dockerfile: ingestion/Dockerfile
+    container_name: anchor-ingestion
+    profiles: ["batch"]
+    env_file:
+      - .env
+    environment:
+      CHROMA_PERSIST_DIR: /app/chroma_data
+    volumes:
+      - chroma_data:/app/chroma_data
+      - ./data:/app/data
+
+volumes:
+  chroma_data:
+  ollama_models:

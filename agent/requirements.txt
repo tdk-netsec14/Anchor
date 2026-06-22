@@ -1,0 +1,20 @@
+# Anchor — Agent API runtime dependencies.
+#
+# torch is pulled from the CPU wheel index at build time (see agent/Dockerfile)
+# so images do not carry several GB of CUDA runtime.
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.32,<1.0
+pydantic>=2.9,<3.0
+pydantic-settings>=2.6,<3.0
+python-multipart>=0.0.12
+PyJWT>=2.9,<3.0
+httpx>=0.27,<1.0
+numpy>=1.26,<3.0
+
+# Retrieval stack (shared with the ingestion service).
+chromadb>=0.5.23,<1.0
+sentence-transformers>=3.3,<6.0
+pypdf>=5.1,<7.0
+pypdfium2>=4.30
+pytesseract>=0.3.13
+Pillow>=10.4
