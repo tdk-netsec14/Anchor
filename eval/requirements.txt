@@ -1,0 +1,7 @@
+# Anchor — Evaluation harness dependencies.
+# The harness talks to the Agent API over HTTP, so it only needs an HTTP client
+# plus a local embedding model for the semantic-similarity grader.
+httpx>=0.27,<1.0
+pytest>=8.3,<10.0
+numpy>=1.26,<3.0
+sentence-transformers>=3.3,<6.0
