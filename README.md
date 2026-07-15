@@ -569,6 +569,12 @@ repository — 20 cases against the **containerised** Agent API serving
 Reproduce them with the commands above; expect different numbers on different
 hardware or models.
 
+> **This run predates the tool-use fixes described below**, and its 16/20 is
+> the *before* figure. Three of the four failures have since been fixed and
+> re-verified individually; a full post-fix re-run has not been done, so no
+> updated pass rate is quoted here. The block is left as the run that
+> originally exposed the defect, rather than quietly restated.
+
 ```
 ANCHOR EVALUATION REPORT
 ========================================================================
@@ -605,31 +611,64 @@ both are the model rather than the system:
 
 | Case | What happened | Whose fault |
 |---|---|---|
-| `tool_001` | The model asked the calculator for `(1250 * 0.15) + 40` and reported 227.5 instead of 187.5. The calculator computed exactly what it was told. | The 3B model invented a `+40` term. |
-| `tool_004`, `tool_005` | `create_ticket` ran and returned `TCK-…`, but the model paraphrased instead of quoting the id — despite an explicit prompt rule to quote returned identifiers. | The 3B model, twice. |
+| `tool_001` | The model asked the calculator for `(1250 * 0.15) + 40` and reported 227.5 instead of 187.5. The calculator computed exactly what it was told. | **Ours, mostly.** The `+40` came from our own schema example, which was character-for-character the wrong expression. |
+| `tool_004`, `tool_005` | `create_ticket` ran and returned `TCK-…`, but the model paraphrased instead of quoting the id — despite an explicit prompt rule to quote returned identifiers. | The 3B model, twice. Now handled by the flagged reference guarantee below. |
 | `tool_002` | The answer ("135 USD") is correct; only the LLM judge scored it below threshold. | Judge variance — a 3B judge is noisy. |
 
 Note what the tool-call counts show: all three tools fired, sixteen times, with
-zero dispatch failures. The weakness is *argument faithfulness* — what the model
-asks the tools to do — not the tools or the loop.
+zero dispatch failures. The weakness looked like *argument faithfulness* — what
+the model asks the tools to do — rather than the tools or the loop.
 
-**The arithmetic defect is worth stating precisely**, because it is easy to
-over- or under-sell. Repeating each case against `llama3.2:3b` through the
-running API:
+**That diagnosis was wrong, and the correction is the interesting part.**
 
-| Question | Correct | What the model passed instead |
-|---|---|---|
-| `3 × 45` | 2/2 | — |
-| `7 × 275` | 3/4 | `(275 * 7) + 40` once |
-| `1250 × 15%` | 0/2 | `(1250 * 0.15) + 40`, both times |
+The first diagnosis blamed the 3B model for inventing arithmetic terms. It is
+partly true, but it missed the largest cause, which was ours:
 
-So it is **query-specific and reproducible, not universal**: some expressions
-the 3B model transcribes perfectly, and at least one it corrupts every time by
-appending a `+40`. The calculator itself is correct in all cases — verified
-directly (`7 * 275` → 1925, `(7 * 275) + 40` → 1965) and by unit tests. This is
-a model limitation with no code-level fix; a stronger model removes it, and the
-evaluation suite is what catches it. Anchor reports the wrong number without
-flagging it, which is the honest characterisation.
+```
+# agent/tools/calculator_tool.py, before
+description="Arithmetic expression, e.g. '(1250 * 0.15) + 40'."
+```
+
+That few-shot example **is** the expression the model emitted for `tool_001`.
+It was not inventing a `+40`; it was copying ours and carrying the `+40` along
+into a user's question. A schema example is not neutral — a small model treats
+it as the template to fill in.
+
+The fix was to remove the domain-shaped example, replace it with a neutral one,
+and state the constraint the tool actually cares about:
+
+```
+description="Arithmetic expression built only from numbers stated in the
+question, e.g. '3 * (4 + 2)'."
+```
+
+plus, on the tool itself: *"Build the expression from the numbers the user
+actually gave: do not add a fee, tax, service charge, buffer or any other
+constant that was not stated, and do not round."* The system prompt's
+arithmetic rule was tightened to match.
+
+`tool_005` was a different failure and is genuinely the model's. It ran
+`create_ticket`, received the id, and reported the ticket without quoting it.
+Prompt wording did not fix it; neither did putting the id on its own labelled
+line in the tool result. What did fix it is a **deterministic, flagged
+guarantee**: a tool may declare `reference_pattern`, and if the final answer
+omits a value matching it, the agent appends that value and records
+`tool_reference_surfaced`.
+
+That is a repair, not a fabrication — the id is real output from the real tool
+— and it is deliberately loud. The flag appears in the response, the structured
+log, the metrics registry and the Analytics screen, so a reader can always see
+that the system supplied a reference the model omitted. Only `create_ticket`
+opts in; the calculator deliberately does not, because its defect was a wrong
+*expression*, and appending a number the model mis-derived would paper over the
+actual bug.
+
+**Re-verification.** All three cases pass against the running API after the
+fix (`tool_001` now passes `1250 * (15 / 100)`, `tool_003` `7 * 275`, and
+`tool_005` returns the id with the `tool_reference_surfaced` flag set). Nine
+tests were added: six over the guardrail function and three driving the agent
+loop end to end. The remaining 17 cases were **not** re-run against a live
+model, so treat the pass rate above as the pre-fix figure.
 
 Latency is high because this is CPU-only inference of a 3B model with no GPU;
 on hardware with a GPU the same run is one to two orders of magnitude faster.

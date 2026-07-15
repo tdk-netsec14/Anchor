@@ -461,12 +461,17 @@ are what stops a grader from silently passing everything.
   *observed*, not just feared: in one evaluation run, case `oos_003` (parental
   leave for secondary caregivers) retrieved nothing, and the model correctly
   refused a question it should have answered.
-- Small local models are not reliable at argument faithfulness. Measured on
-  `llama3.2:3b`: the model passed `(1250 * 0.15) + 40` to the calculator for a
-  question whose answer is 187.5, and twice created a ticket and then
-  paraphrased the result instead of quoting the ticket id, despite an explicit
-  prompt rule to quote returned identifiers. The tools executed exactly what
-  they were given — the model chose the arguments.
+- Small local models are not reliable at argument faithfulness, but part of
+  what looked like that was our own fault. Measured on `llama3.2:3b`, the
+  calculator was asked for `(1250 * 0.15) + 40` on a question whose answer is
+  187.5 — and that expression was character-for-character the few-shot example
+  in the tool's own JSON schema. The model was copying our template. Removing
+  the domain-shaped example and stating the "only numbers the user gave"
+  constraint fixed the arithmetic cases. The separate case of a created ticket
+  not being quoted back was genuinely the model's, and is now covered by the
+  `reference_pattern` guarantee in `output_guard.surface_missing_references`,
+  which appends the value and flags `tool_reference_surfaced` rather than
+  silently patching the answer.
 - The knowledge base is global; there is no per-user or per-team document
   visibility filter.
 - The LLM judge is a local model and is noisy. On a correct answer it rated
