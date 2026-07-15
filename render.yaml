@@ -1,0 +1,67 @@
+# Render blueprint for the Anchor agent API.
+#
+#   1. Set JWT_SECRET and at least one provider key as environment variables
+#      either in the dashboard or with `render blueprint launch`.
+#   2. The disk below is REQUIRED, not optional: ChromaDB persists to the
+#      local filesystem, and Render's container filesystem is wiped on every
+#      deploy and restart. Without the disk, the knowledge base silently comes
+#      back empty after each release. See README "Production data" for the
+#      managed alternatives.
+#
+# Values marked sync: false are intentionally unset — no secret is committed.
+
+services:
+  - type: web
+    name: anchor-agent
+    runtime: docker
+    dockerfilePath: ./agent/Dockerfile
+    dockerContext: .
+    plan: starter
+    healthCheckPath: /health
+    # Embeddings and the model weights download on first boot; the default
+    # deploy timeout is not enough on a cold image.
+    autoDeploy: true
+    disk:
+      name: anchor-chroma
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHONPATH
+        value: /app
+      # Must be one of dev|test|prod — anything else fails validation and the
+      # service will not boot.
+      - key: ENVIRONMENT
+        value: prod
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_JSON
+        value: "true"
+      - key: PORT
+        value: "8000"
+
+      # --- Vector store: mounted on the disk above, not the container FS ---
+      - key: CHROMA_PERSIST_DIR
+        value: /var/data/chroma
+      - key: TICKETS_DIR
+        value: /var/data/tickets
+
+      # --- Required, set in the dashboard ---
+      - key: JWT_SECRET
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+
+      # --- Routing ---
+      - key: ROUTER_DEFAULT_MODEL
+        value: groq/llama-3.3-70b-versatile
+      - key: ROUTER_FALLBACK_CHAIN
+        value: groq,openai
+      # The frontend proxies through Vercel, so no browser origin reaches the
+      # API directly and CORS can stay off. Set this only if you also point a
+      # browser at https://<service>.onrender.com.
+      - key: CORS_ALLOWED_ORIGINS
+        value: ""
