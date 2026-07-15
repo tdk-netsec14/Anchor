@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from agent.agent import AnchorAgent
 from agent.routing.router import ModelRouter
-from agent.tools.registry import ToolRegistry
+from agent.tools.create_ticket_tool import CreateTicketArgs
+from agent.tools.registry import Tool, ToolRegistry
 from tests.fakes import FakeRetriever, ScriptedProvider, text_response, tool_response
 
 pytestmark = pytest.mark.integration
@@ -176,6 +178,89 @@ async def test_create_ticket_writes_a_file(registry: ToolRegistry) -> None:
     assert record["priority"] == "high"
     assert record["simulated"] is True
     assert "VPN" in record["summary"]
+
+
+@pytest.mark.asyncio
+async def test_a_ticket_id_reaches_the_answer_even_when_the_model_omits_it(
+    registry: ToolRegistry,
+) -> None:
+    """A ticket the user cannot quote is not a usable escalation.
+
+    The model here reports the ticket without repeating the id, which is what
+    a small model does routinely. The agent is expected to supply the
+    reference and to say that it did.
+    """
+    provider = ScriptedProvider(
+        script=[
+            tool_response("create_ticket", {"summary": "Laptop will not charge", "priority": "high"}),
+            text_response("I have raised a support ticket for you [S1]."),
+        ]
+    )
+    outcome = await build_agent(registry=registry, provider=provider).answer(
+        "My laptop will not charge, please escalate"
+    )
+
+    ticket_id = registry.get("create_ticket").tickets_dir
+    ids = [p.stem for p in ticket_id.glob("*.json")]
+    assert len(ids) == 1
+    assert ids[0] in outcome.answer
+    assert "tool_reference_surfaced" in outcome.guardrail_flags
+
+
+class _FixedIdTicketTool(Tool):
+    """A ticket tool with a deterministic id, so quoting can be tested.
+
+    The real tool mints a uuid, which makes "did the model already quote it?"
+    untestable through the loop.
+    """
+
+    name = "fixed_ticket"
+    description = "Create a support ticket."
+    args_model = CreateTicketArgs
+    reference_pattern = r"TCK-FIXED1234"
+    reference_label = "Ticket reference"
+
+    def run(self, **kwargs: Any) -> str:
+        return "TICKET ID: TCK-FIXED1234\nPriority: high\nStatus: created."
+
+
+@pytest.mark.asyncio
+async def test_a_quoted_ticket_id_is_left_alone() -> None:
+    """When the model does quote the id, nothing is appended and nothing flagged."""
+    registry = ToolRegistry()
+    registry.register(_FixedIdTicketTool())
+    provider = ScriptedProvider(
+        script=[
+            tool_response("fixed_ticket", {"summary": "Monitor flickers", "priority": "high"}),
+            text_response("I have raised ticket TCK-FIXED1234 for you [S1]."),
+        ]
+    )
+    outcome = await build_agent(registry=registry, provider=provider).answer(
+        "My monitor flickers, please escalate"
+    )
+
+    assert "TCK-FIXED1234" in outcome.answer
+    assert "tool_reference_surfaced" not in outcome.guardrail_flags
+    assert outcome.answer.strip().endswith("[S1].")
+
+
+@pytest.mark.asyncio
+async def test_a_missing_ticket_id_is_appended_and_flagged() -> None:
+    """The mirror case: the model omits it, so the agent supplies it."""
+    registry = ToolRegistry()
+    registry.register(_FixedIdTicketTool())
+    provider = ScriptedProvider(
+        script=[
+            tool_response("fixed_ticket", {"summary": "Monitor flickers", "priority": "high"}),
+            text_response("I have raised a support ticket for you [S1]."),
+        ]
+    )
+    outcome = await build_agent(registry=registry, provider=provider).answer(
+        "My monitor flickers, please escalate"
+    )
+
+    assert "TCK-FIXED1234" in outcome.answer
+    assert "tool_reference_surfaced" in outcome.guardrail_flags
 
 
 @pytest.mark.asyncio

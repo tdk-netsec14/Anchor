@@ -47,6 +47,22 @@ class Tool(ABC):
     #: Pydantic model describing the tool's arguments.
     args_model: type[BaseModel] | None = None
 
+    #: Optional guarantee that a value the user needs reaches the answer.
+    #:
+    #: Some tools mint an identifier the user has to be able to quote back to
+    #: support — a ticket id being the obvious case. A model that says "I have
+    #: created a support ticket" and drops the id has produced an answer the
+    #: user cannot act on, and small models do that routinely no matter how the
+    #: system prompt is worded.
+    #:
+    #: A tool sets `reference_pattern` to declare "values matching this regex
+    #: are quotable references", and `reference_label` to name them in the
+    #: fallback line. The agent then guarantees they appear, appending the
+    #: missing one and recording a guardrail flag so the repair is visible in
+    #: the response, the logs and the metrics rather than being silent.
+    reference_pattern: str | None = None
+    reference_label: str = "Reference"
+
     def spec(self) -> ToolSpec:
         schema: dict[str, Any]
         if self.args_model is not None:

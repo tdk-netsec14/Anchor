@@ -66,7 +66,10 @@ _FUNCTIONS: dict[str, Any] = {
 class CalculatorArgs(BaseModel):
     expression: str = Field(
         max_length=MAX_EXPRESSION_LENGTH,
-        description="Arithmetic expression, e.g. '(1250 * 0.15) + 40'.",
+        description=(
+            "Arithmetic expression built only from numbers stated in the "
+            "question, e.g. '3 * (4 + 2)'."
+        ),
     )
 
 
@@ -160,7 +163,11 @@ class CalculatorTool(Tool):
         "calculation - currency, percentages, totals, differences - instead of "
         "computing it yourself. Only numbers, + - * / // % **, parentheses and "
         "the functions abs, min, max, round, floor, ceil, sqrt, log, log10, exp "
-        "and pow are supported."
+        "and pow are supported. "
+        "Build the expression from the numbers the user actually gave: do not "
+        "add a fee, tax, service charge, buffer or any other constant that was "
+        "not stated, and do not round. If a number the calculation needs is "
+        "missing, say so instead of inventing it."
     )
     args_model = CalculatorArgs
 

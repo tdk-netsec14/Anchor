@@ -198,3 +198,50 @@ def build_format_retry_instruction() -> str:
         "markdown headers, or code fences. If the answer is not in the provided "
         "context, say so plainly and suggest creating a support ticket."
     )
+
+
+#: Flag recorded when a quotable tool reference had to be appended.
+REFERENCE_SURFACED_FLAG = "tool_reference_surfaced"
+
+
+def surface_missing_references(
+    text: str,
+    references: list[tuple[str, str]],
+) -> tuple[str, list[str]]:
+    """Ensure every quotable tool reference appears in the answer.
+
+    `references` is a list of ``(label, value)`` pairs collected from the tools
+    that ran. A value already present in the answer is left alone. A missing
+    one is appended as a short factual line.
+
+    This is a repair, not a fabrication: the value is real, it came back from
+    the tool, and the call is recorded in ``guardrail_flags`` so a reader can
+    see that the system supplied it rather than the model. It exists because
+    "I have raised a ticket for you" is an unusable answer when the user
+    cannot quote the ticket, and small models drop the identifier regardless of
+    how the system prompt is worded.
+
+    Returns the (possibly extended) text and the values that were appended.
+    """
+    if not references:
+        return text, []
+
+    missing: list[tuple[str, str]] = []
+    for label, value in references:
+        if value and value not in text:
+            missing.append((label, value))
+
+    if not missing:
+        return text, []
+
+    appended = [f"{label}: {value}" for label, value in missing]
+    repaired = text.rstrip()
+    repaired = f"{repaired}\n\n" + "\n".join(appended) if repaired else "\n".join(appended)
+
+    log.warning(
+        "output.tool_reference_surfaced",
+        context={"references": [value for _, value in missing]},
+    )
+    registry.record_guardrail_block(REFERENCE_SURFACED_FLAG)
+
+    return repaired, [value for _, value in missing]

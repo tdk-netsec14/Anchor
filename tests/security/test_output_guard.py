@@ -6,10 +6,12 @@ import pytest
 
 from agent.guardrails.output_guard import (
     REDACTED,
+    REFERENCE_SURFACED_FLAG,
     check_citations,
     inspect_output,
     looks_structured,
     redact_pii,
+    surface_missing_references,
 )
 
 pytestmark = pytest.mark.security
@@ -127,3 +129,50 @@ def test_pii_and_fabrication_are_reported_independently() -> None:
     )
     assert "output_pii_redacted" in result.flags
     assert "output_unsupported_source" in result.flags
+
+
+# --------------------------------------------------------------------------
+# Tool reference guarantee
+# --------------------------------------------------------------------------
+# A ticket id is the only handle the user has on an escalation, so it has to
+# reach the answer. These pin the contract: present references are left alone,
+# missing ones are appended, and nothing is invented.
+REF = ("Ticket reference", "TCK-1234ABCD")
+
+
+def test_a_reference_already_in_the_answer_is_left_untouched() -> None:
+    text, appended = surface_missing_references(
+        "I have raised ticket TCK-1234ABCD for you.", [REF]
+    )
+    assert text == "I have raised ticket TCK-1234ABCD for you."
+    assert appended == []
+
+
+def test_a_missing_reference_is_appended_to_the_answer() -> None:
+    text, appended = surface_missing_references(
+        "I have created a support ticket.", [REF]
+    )
+    assert "TCK-1234ABCD" in text
+    assert appended == ["TCK-1234ABCD"]
+
+
+def test_appending_preserves_the_models_own_prose() -> None:
+    text, _ = surface_missing_references("A ticket has been raised.", [REF])
+    assert text.startswith("A ticket has been raised.")
+    assert text.rstrip().endswith("Ticket reference: TCK-1234ABCD")
+
+
+def test_several_missing_references_are_all_appended() -> None:
+    text, appended = surface_missing_references("Done.", [REF, ("Other", "X-99")])
+    assert {"TCK-1234ABCD", "X-99"} <= set(appended)
+    assert "X-99" in text
+
+
+def test_no_references_means_the_answer_is_unchanged() -> None:
+    text, appended = surface_missing_references("An answer.", [])
+    assert text == "An answer."
+    assert appended == []
+
+
+def test_the_flag_names_the_repair() -> None:
+    assert REFERENCE_SURFACED_FLAG == "tool_reference_surfaced"

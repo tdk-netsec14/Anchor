@@ -13,6 +13,7 @@ refuse - none of them orchestrate.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -44,6 +45,8 @@ class AgentOutcome:
     answer: str
     sources: list[str] = field(default_factory=list)
     source_details: list[SourceDetail] = field(default_factory=list)
+    #: ``(label, value)`` pairs a tool declared as quotable references.
+    tool_references: list[tuple[str, str]] = field(default_factory=list)
     allowed_source_tags: set[str] = field(default_factory=set)
     model_used: str = ""
     provider: str = ""
@@ -222,6 +225,9 @@ class AnchorAgent:
                     latency_ms=result.latency_ms,
                 )
             )
+            # Captured here, from the full result, rather than parsed back out
+            # of the truncated preview the response carries.
+            outcome.tool_references.extend(self._references_from(call.name, result.content))
             messages.append(
                 Message(
                     role="tool",
@@ -340,7 +346,33 @@ class AnchorAgent:
         if check.unsupported_sources:
             outcome.guardrail_flags.append("output_unsupported_source")
 
+        # Last, so it runs over the final text: a tool that minted a
+        # quotable identifier (a ticket id) has its reference guaranteed to
+        # reach the caller, and the repair is flagged rather than silent.
+        if outcome.tool_references:
+            outcome.answer, surfaced = output_guard.surface_missing_references(
+                outcome.answer, outcome.tool_references
+            )
+            if surfaced:
+                outcome.guardrail_flags.append(output_guard.REFERENCE_SURFACED_FLAG)
+
         return outcome
+
+    def _references_from(self, tool_name: str, content: str) -> list[tuple[str, str]]:
+        """Quotable references declared by a tool that just ran.
+
+        Reads the tool's own declaration rather than the response, so a tool
+        opts in by setting `reference_pattern` and a tool that did not run can
+        never contribute one.
+        """
+        tool = self.tools.get(tool_name)
+        pattern = getattr(tool, "reference_pattern", None)
+        if not pattern:
+            return []
+        label = getattr(tool, "reference_label", "Reference")
+        # de-duplicated, order preserved: several references for one call are
+        # surfaced once each.
+        return list(dict.fromkeys((label, match) for match in re.findall(pattern, content)))
 
 
 def _safe_arguments(arguments: dict[str, Any]) -> dict[str, Any]:

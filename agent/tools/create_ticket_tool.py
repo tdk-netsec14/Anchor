@@ -65,6 +65,10 @@ class CreateTicketTool(Tool):
         "system, so do not tell the user it has been routed to IT support."
     )
     args_model = CreateTicketArgs
+    # The ticket id is the only handle the user has on the escalation, so it is
+    # guaranteed to reach the answer even if the model's prose omits it.
+    reference_pattern = r"TCK-[0-9A-F]{8}"
+    reference_label = "Ticket reference"
 
     def __init__(self, tickets_dir: str | Path | None = None) -> None:
         self._tickets_dir = tickets_dir
@@ -101,8 +105,12 @@ class CreateTicketTool(Tool):
             "tool.ticket_created",
             context={"ticket_id": ticket["id"], "priority": priority},
         )
+        # The id leads, on its own labelled line. A weaker model reliably
+        # reports "I have created a ticket" and then drops the reference,
+        # which leaves the user with nothing they can quote back to support.
         return (
-            f"Created ticket {ticket['id']} with priority '{priority}'. "
-            "In this demonstration system no external ticketing system is "
-            "contacted - the ticket is recorded locally only."
+            f"TICKET ID: {ticket['id']}\n"
+            f"Priority: {priority}\n"
+            f"Status: created and recorded locally. This demonstration system "
+            "does not contact an external ticketing system."
         )
