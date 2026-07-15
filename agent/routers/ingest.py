@@ -7,7 +7,7 @@ rather than relying on the client to hide the button.
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from starlette.concurrency import run_in_threadpool
@@ -191,7 +191,7 @@ async def list_documents(user: CurrentUserDep) -> dict[str, Any]:
             for k, v in sorted(docs_map.items())
         ]
         return {"documents": docs_list, "total_chunks": len(metadatas)}
-    except Exception as exc:
+    except Exception:
         log.error("documents.list_failed", exc_info=True)
         return {"documents": [], "total_chunks": 0}
 
