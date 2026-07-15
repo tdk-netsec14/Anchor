@@ -62,3 +62,16 @@ async def metrics(user: CurrentUserDep) -> dict[str, Any]:
 
     log.info("metrics.read", context={"user_id": user.user_id, "role": user.role})
     return snapshot
+
+
+@router.get(
+    "/activity",
+    summary="Recent query events and execution traces",
+    description=(
+        "Returns recent query execution logs from the running session. "
+        "Requires a bearer token."
+    ),
+)
+async def activity(user: CurrentUserDep) -> dict[str, Any]:
+    return {"items": registry.get_recent_activity()}
+

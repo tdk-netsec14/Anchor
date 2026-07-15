@@ -56,3 +56,35 @@ async def health() -> HealthResponse:
             "queries_served": snapshot["total_queries"],
         },
     )
+
+
+@router.get(
+    "/settings",
+    summary="Safe runtime configuration info",
+    description="Returns safe configuration options without exposing credentials or keys.",
+)
+async def settings_info() -> dict[str, Any]:
+    settings = get_settings()
+    from agent.routing.router import get_router
+    router_instance = get_router()
+    configured_providers = list(router_instance.configured_providers().keys())
+    return {
+        "app_name": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        "environment": settings.ENVIRONMENT,
+        "default_model": settings.ROUTER_DEFAULT_MODEL,
+        "fallback_chain": settings.fallback_chain,
+        "configured_providers": configured_providers,
+        "embedding_model": settings.EMBEDDING_MODEL,
+        "chroma_collection": settings.CHROMA_COLLECTION,
+        "retriever_top_k": settings.RETRIEVER_TOP_K,
+        "chunk_size_tokens": settings.CHUNK_SIZE_TOKENS,
+        "chunk_overlap_tokens": settings.CHUNK_OVERLAP_TOKENS,
+        "query_max_chars": settings.QUERY_MAX_CHARS,
+        "max_upload_mb": settings.MAX_UPLOAD_MB,
+        "ocr_enabled": settings.OCR_ENABLED,
+        "ocr_language": settings.OCR_LANGUAGE,
+        "llm_temperature": settings.LLM_TEMPERATURE,
+        "llm_max_tokens": settings.LLM_MAX_TOKENS,
+    }
+

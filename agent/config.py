@@ -91,7 +91,9 @@ class Settings(BaseSettings):
     # bundled demo page needs this: it is same-origin, so this exists purely so
     # a UI can be developed on a different port. Set to an empty string to
     # disable CORS entirely, which is what a real deployment should do.
-    CORS_ALLOWED_ORIGINS: str = "http://localhost:8000,http://127.0.0.1:8000"
+    CORS_ALLOWED_ORIGINS: str = (
+        "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8000,http://127.0.0.1:8000"
+    )
 
     @field_validator("LOG_LEVEL")
     @classmethod

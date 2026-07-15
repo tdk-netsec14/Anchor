@@ -43,6 +43,7 @@ class MetricsRegistry:
     tool_calls_by_name: dict[str, int] = field(default_factory=dict)
     guardrail_flags: dict[str, int] = field(default_factory=dict)
     routing_reasons: dict[str, int] = field(default_factory=dict)
+    recent_activity: list[dict[str, Any]] = field(default_factory=list)
 
     # -- recording ---------------------------------------------------------
     def record_query(
@@ -57,6 +58,9 @@ class MetricsRegistry:
         tool_calls: list[str] | None = None,
         guardrail_flags: list[str] | None = None,
         routing_reason: str | None = None,
+        query: str | None = None,
+        request_id: str | None = None,
+        sources_count: int = 0,
     ) -> None:
         tool_calls = tool_calls or []
         guardrail_flags = guardrail_flags or []
@@ -76,6 +80,28 @@ class MetricsRegistry:
                 self._bump(self.guardrail_flags, flag)
             if routing_reason:
                 self._bump(self.routing_reasons, routing_reason)
+
+            activity_item = {
+                "id": request_id or f"req_{int(time.time()*1000)}",
+                "timestamp": time.time(),
+                "query": query[:120] if query else "",
+                "latency_ms": round(latency_ms, 2),
+                "model": model or "unknown",
+                "provider": provider or "unknown",
+                "tokens_used": prompt_tokens + completion_tokens,
+                "cost_usd": round(cost_usd, 6),
+                "tool_calls": list(tool_calls),
+                "guardrail_flags": list(guardrail_flags),
+                "sources_count": sources_count,
+                "routing_reason": routing_reason or "",
+            }
+            self.recent_activity.insert(0, activity_item)
+            if len(self.recent_activity) > 50:
+                self.recent_activity.pop()
+
+    def get_recent_activity(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self.recent_activity)
 
     def record_request(self, endpoint: str) -> None:
         with self._lock:

@@ -178,9 +178,10 @@ def create_app() -> FastAPI:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=[o.strip() for o in settings.CORS_ALLOWED_ORIGINS.split(",") if o.strip()],
-            allow_credentials=False,
-            allow_methods=["GET", "POST", "OPTIONS"],
-            allow_headers=["Authorization", "Content-Type"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["X-Request-ID", "X-Response-Time-ms"],
         )
 
     app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")

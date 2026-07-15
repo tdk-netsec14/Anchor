@@ -12,7 +12,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from starlette.concurrency import run_in_threadpool
 
-from agent.auth import require_role
+from agent.auth import CurrentUserDep, require_role
 from agent.config import get_settings
 from agent.observability.logger import get_logger
 from agent.observability.metrics import registry
@@ -23,12 +23,9 @@ from ingestion.pipeline import (
     IngestionError,
     ingest_document,
 )
-from ingestion.vector_store import VectorStoreError
+from ingestion.vector_store import VectorStoreError, get_vector_store
 
-# `Depends(require_role("admin"))` must receive the *callable*, not the
-# Annotated alias - handing FastAPI an Annotated type makes it introspect the
-# alias itself and invent `args`/`kwargs` query parameters.
-router = APIRouter(tags=["ingestion"], dependencies=[Depends(require_role("admin"))])
+router = APIRouter(tags=["ingestion"])
 log = get_logger(__name__)
 
 #: Every PDF starts with this; checked so a mislabelled upload produces a clear
@@ -87,6 +84,7 @@ async def _read_limited(upload: UploadFile, max_bytes: int) -> bytes:
         "Requires the `admin` role. Re-uploading a document with the same name "
         "replaces its previous chunks."
     ),
+    dependencies=[Depends(require_role("admin"))],
 )
 async def ingest_pdf(
     file: Annotated[UploadFile, File(description="PDF file to index.")],
@@ -151,3 +149,68 @@ async def ingest_pdf(
 
     registry.record_ingestion(result.chunks_created)
     return IngestResponse(**result.to_dict())  # type: ignore[arg-type]
+
+
+@router.get(
+    "/documents",
+    summary="List indexed knowledge base documents",
+    description="Returns all unique documents indexed in ChromaDB with chunk and page counts. Requires authentication.",
+)
+async def list_documents(user: CurrentUserDep) -> dict[str, Any]:
+    store = get_vector_store()
+    try:
+        data = store.collection.get(include=["metadatas"])
+        metadatas = data.get("metadatas") or []
+        docs_map: dict[str, dict[str, Any]] = {}
+        for m in metadatas:
+            if not m:
+                continue
+            doc_name = m.get("doc_name", "unknown")
+            page = m.get("page_number")
+            ocr = m.get("ocr_used", False)
+            if doc_name not in docs_map:
+                docs_map[doc_name] = {
+                    "doc_name": doc_name,
+                    "chunks": 0,
+                    "pages": set(),
+                    "ocr_used": False,
+                }
+            docs_map[doc_name]["chunks"] += 1
+            if page:
+                docs_map[doc_name]["pages"].add(page)
+            if ocr:
+                docs_map[doc_name]["ocr_used"] = True
+
+        docs_list = [
+            {
+                "doc_name": k,
+                "chunks": v["chunks"],
+                "page_count": len(v["pages"]) if v["pages"] else 1,
+                "ocr_used": v["ocr_used"],
+            }
+            for k, v in sorted(docs_map.items())
+        ]
+        return {"documents": docs_list, "total_chunks": len(metadatas)}
+    except Exception as exc:
+        log.error("documents.list_failed", exc_info=True)
+        return {"documents": [], "total_chunks": 0}
+
+
+@router.delete(
+    "/documents/{doc_name}",
+    summary="Delete a document from the knowledge base (admin only)",
+    description="Removes all chunks associated with the document from ChromaDB.",
+    dependencies=[Depends(require_role("admin"))],
+)
+async def delete_document(doc_name: str) -> dict[str, Any]:
+    store = get_vector_store()
+    try:
+        store.delete_document(doc_name)
+        return {"status": "deleted", "doc_name": doc_name}
+    except Exception as exc:
+        log.error("documents.delete_failed", context={"doc_name": doc_name}, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "delete_failed", "message": f"Could not delete {doc_name}."},
+        ) from exc
+
