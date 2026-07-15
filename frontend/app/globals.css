@@ -1,0 +1,170 @@
+@import "tailwindcss";
+
+/* Class-based dark mode. Tailwind v4 defaults to prefers-color-scheme, which
+   would fight the manual toggle in the top bar. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  /* Surfaces, warm-neutral so the page does not read as clinical blue-white. */
+  --bg: #faf9f7;
+  --surface: #ffffff;
+  --surface-2: #f4f2ef;
+  --border: #e5e2dd;
+  --border-strong: #d3cec7;
+
+  /* Type ramp. */
+  --fg: #1a1917;
+  --fg-muted: #5c5852;
+  --fg-subtle: #8a857d;
+
+  /* One accent, used only for interactive and status-meaningful elements. */
+  --accent: #0d7377;
+  --accent-hover: #0a5c5f;
+  --accent-fg: #ffffff;
+  --accent-soft: #e2f1f0;
+
+  --success: #16794c;
+  --success-soft: #e2f1e8;
+  --warning: #8a5a12;
+  --warning-soft: #f7eeda;
+  --danger: #a32c25;
+  --danger-soft: #f8e6e4;
+
+  --ring: #0d7377;
+
+  /* Data-mark colours. Deliberately a separate, more chromatic step from
+     --accent: the UI accent is tuned for text and borders, where low chroma
+     reads as calm, but a chart mark at that chroma reads as grey. These two
+     are validated for lightness band, chroma floor, CVD separation and
+     contrast against their own surface. */
+  --chart-1: #00999a;
+  --chart-2: #c2801c;
+  --chart-grid: #e5e2dd;
+}
+
+.dark {
+  --bg: #100f0e;
+  --surface: #191817;
+  --surface-2: #211f1d;
+  --border: #2c2a27;
+  --border-strong: #3b3835;
+
+  --fg: #f5f3f0;
+  --fg-muted: #a8a29a;
+  --fg-subtle: #7d776f;
+
+  --accent: #2aa9a5;
+  --accent-hover: #46c0bb;
+  --accent-fg: #06201f;
+  --accent-soft: #16302f;
+
+  --success: #4ec98a;
+  --success-soft: #14301f;
+  --warning: #d6a445;
+  --warning-soft: #322613;
+  --danger: #e8776c;
+  --danger-soft: #351b18;
+
+  --ring: #2aa9a5;
+
+  --chart-1: #1f9e9a;
+  --chart-2: #bb8630;
+  --chart-grid: #2c2a27;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+
+  --font-sans: var(--font-sans-stack);
+  --font-mono: var(--font-mono-stack);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-grid: var(--chart-grid);
+}
+
+* {
+  border-color: var(--border);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--fg);
+}
+
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+/* Slim scrollbars that follow the theme instead of punching a light hole in
+   the dark UI. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background-color: var(--border-strong);
+  border-radius: 9999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes anchor-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.animate-fade-up {
+  animation: anchor-fade-up 0.32s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-up {
+    animation: none;
+  }
+  html {
+    scroll-behavior: auto;
+  }
+}
