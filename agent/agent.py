@@ -26,7 +26,7 @@ from agent.observability.logger import get_logger
 from agent.rag.retriever import RetrievalResult, Retriever, build_context
 from agent.routing.providers.base import Message, ProviderError, ToolCall
 from agent.routing.router import AllProvidersFailed, ModelRouter, RoutingDecision
-from agent.schemas.query import ToolCallRecord
+from agent.schemas.query import SourceDetail, ToolCallRecord
 from agent.tools.parsing import parse_text_tool_calls
 from agent.tools.registry import ToolRegistry
 
@@ -43,6 +43,7 @@ class AgentOutcome:
 
     answer: str
     sources: list[str] = field(default_factory=list)
+    source_details: list[SourceDetail] = field(default_factory=list)
     allowed_source_tags: set[str] = field(default_factory=set)
     model_used: str = ""
     provider: str = ""
@@ -103,6 +104,17 @@ class AnchorAgent:
         outcome = AgentOutcome(
             answer="",
             sources=[c.citation for c in result.chunks],
+            source_details=[
+                SourceDetail(
+                    citation=c.citation,
+                    doc_name=c.doc_name,
+                    page_number=c.page_number,
+                    chunk_id=c.chunk_id,
+                    score=c.score,
+                    excerpt=c.text[:RESULT_PREVIEW_CHARS].strip(),
+                )
+                for c in result.chunks
+            ],
             allowed_source_tags=allowed_tags,
             model_used=decision.model_id,
             provider=decision.provider,

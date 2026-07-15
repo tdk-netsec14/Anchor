@@ -165,6 +165,9 @@ async def query(
         tool_calls=[t.name for t in outcome.tool_calls],
         guardrail_flags=outcome.guardrail_flags,
         routing_reason=outcome.routing_reason,
+        query=payload.query,
+        request_id=getattr(request.state, "request_id", None),
+        sources_count=len(outcome.sources),
     )
 
     log.info(
@@ -190,6 +193,7 @@ async def query(
     return QueryResponse(
         answer=outcome.answer,
         sources=outcome.sources,
+        source_details=outcome.source_details,
         model_used=outcome.model_used,
         tool_calls=outcome.tool_calls,
         latency_ms=round(outcome.latency_ms, 2),

@@ -44,11 +44,32 @@ class ToolCallRecord(BaseModel):
     latency_ms: float = 0.0
 
 
+class SourceDetail(BaseModel):
+    """One retrieved chunk, with the provenance a UI needs to render a citation.
+
+    ``sources`` remains the flat citation strings the output guardrail verifies
+    against; this is the same information in structured form, for display. A
+    chunk surfaced later by the ``search_kb`` tool carries no excerpt, so it
+    appears in ``sources`` only.
+    """
+
+    citation: str
+    doc_name: str
+    page_number: int | None = None
+    chunk_id: str = ""
+    score: float = 0.0
+    excerpt: str = Field(default="", description="Leading text of the chunk, truncated.")
+
+
 class QueryResponse(BaseModel):
     """The full result of one question."""
 
     answer: str
     sources: list[str] = Field(default_factory=list)
+    source_details: list[SourceDetail] = Field(
+        default_factory=list,
+        description="Structured citations, parallel to `sources` where available.",
+    )
     model_used: str
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     latency_ms: float
