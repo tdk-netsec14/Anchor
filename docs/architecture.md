@@ -59,6 +59,37 @@ by email only for the questions a document search genuinely cannot answer.
                   └──────────────────────────────────────────┘
 ```
 
+### 1.1 The web application
+
+A Next.js App Router application (`frontend/`) is the product surface. It is
+not a second implementation of anything above — it is a client, and the Agent
+API remains the only place authorisation and inference happen.
+
+The one structural decision worth recording here is that **the browser never
+calls the Agent API directly**. Authenticated traffic goes:
+
+```
+Browser ──▶ Next.js route handler (Vercel) ──▶ Agent API (Render)
+            holds the httpOnly cookie,            verifies the JWT and
+            attaches it as a Bearer token        enforces the role
+```
+
+Three things follow:
+
+- The access token is never in `localStorage` and never in the client bundle.
+  It is `httpOnly`, so injected script cannot read it, and it is applied to the
+  upstream request by the server rather than the browser.
+- The production path needs **no CORS grant**, because no browser origin
+  reaches FastAPI. `CORS_ALLOWED_ORIGINS` can be empty in that topology.
+- The proxy is not a trust boundary. It carries a credential; FastAPI re-verifies
+  it and re-checks the role on every route, so a user-role token still gets 403
+  on ingestion. Hiding a control in the UI is not what enforces that.
+
+The cost of this shape is a timeout budget: a request has to fit inside the
+frontend function's lifetime as well as the backend's own, so
+`maxDuration` on the query route must exceed
+`LLM_TIMEOUT_SECONDS × (1 + PROVIDER_MAX_RETRIES) × tool iterations`.
+
 ---
 
 ## 2. Services
