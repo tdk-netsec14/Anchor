@@ -8,10 +8,10 @@ importing this module stays cheap and side-effect free.
 from __future__ import annotations
 
 import functools
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -36,6 +36,72 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRY_MINUTES: int = 60
     JWT_ISSUER: str = "anchor"
+
+    # --- Passwords ---------------------------------------------------------
+    # Argon2id. The parameters are the RFC 9106 second-recommended profile,
+    # scaled to whatever this host can afford; ANCHOR sets them in the
+    # environment and the encoded hash records which were used, so raising
+    # them later does not invalidate existing credentials.
+    PASSWORD_MIN_LENGTH: int = 12
+    PASSWORD_MAX_LENGTH: int = 200
+    ARGON2_TIME_COST: int = 3
+    ARGON2_MEMORY_COST_KIB: int = 65536
+    ARGON2_PARALLELISM: int = 2
+    #: Server-side pepper, mixed into the hash alongside the password. Rotating
+    #: it invalidates every stored credential, so it is a real secret and is
+    #: blanked out of the image.
+    CREDENTIAL_PEPPER: str = ""
+    #: Open registration. A deployment that provisions users by invitation
+    #: turns this off and creates accounts through the invite flow instead.
+    AUTH_ALLOW_REGISTRATION: bool = True
+    #: The unauthenticated ``POST /auth/token`` endpoint. It is a development
+    # affordance - no password, self-selected role - and the application
+    #: refuses to serve it when ENVIRONMENT is prod, whatever this says.
+    AUTH_ALLOW_DEMO_TOKENS: bool = True
+    REFRESH_TOKEN_EXPIRY_DAYS: int = 30
+    PASSWORD_RESET_EXPIRY_MINUTES: int = 60
+    #: First user created on an empty database, so a fresh deployment has a
+    #: way in. Applied once, then ignored.
+    BOOTSTRAP_ADMIN_EMAIL: str = ""
+    BOOTSTRAP_ADMIN_PASSWORD: str = ""
+
+    # --- Database ----------------------------------------------------------
+    # Empty means "no database configured", which the persistence-backed
+    # endpoints report as 503 rather than failing in some less obvious way.
+    DATABASE_URL: str = ""
+    #: Applied by ``python -m agent.db.seed``. Creates the bootstrap admin and,
+    # optionally, a demo workspace.
+    SEED_DEMO_WORKSPACE: bool = False
+
+    # --- Object storage ----------------------------------------------------
+    # `local` writes under STORAGE_LOCAL_DIR and is the development default.
+    # `s3` is required in production: a container filesystem is wiped on every
+    # deploy, so uploaded documents stored there would not survive one.
+    STORAGE_BACKEND: Literal["local", "s3"] = "local"
+    STORAGE_LOCAL_DIR: str = "data/uploads"
+    S3_BUCKET: str = ""
+    S3_REGION: str = "us-east-1"
+    S3_ENDPOINT_URL: str = ""
+    S3_ACCESS_KEY_ID: str = ""
+    S3_SECRET_ACCESS_KEY: str = ""
+    #: Path prefix inside the bucket, so several environments can share one.
+    S3_KEY_PREFIX: str = "anchor"
+
+    # --- Background worker -------------------------------------------------
+    WORKER_POLL_SECONDS: float = 2.0
+    WORKER_MAX_ATTEMPTS: int = 3
+
+    # --- Rate limiting and quotas -----------------------------------------
+    # Process-local. Behind more than one API instance this becomes a
+    # per-instance ceiling rather than a global one; the limits below are
+    # sized to be a useful backstop rather than a hard global guarantee.
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_REQUESTS: int = 120
+    RATE_LIMIT_WINDOW_SECONDS: int = 60
+    RATE_LIMIT_QUERY_REQUESTS: int = 20
+    RATE_LIMIT_INGEST_REQUESTS: int = 10
+    #: Daily answered-question ceiling per workspace. 0 disables the check.
+    QUOTA_QUERIES_PER_DAY: int = 0
 
     # --- Vector store ------------------------------------------------------
     CHROMA_PERSIST_DIR: str = "chroma_data"
@@ -79,18 +145,25 @@ class Settings(BaseSettings):
     LLM_MAX_TOKENS: int = 1024
 
     # --- Cost model (USD per 1M tokens) ------------------------------------
-    COST_INPUT_PER_MTOK: dict[str, float] = Field(default_factory=dict)
-    COST_OUTPUT_PER_MTOK: dict[str, float] = Field(default_factory=dict)
+    # Supplied as JSON objects, e.g. {"groq/llama-3.3-70b-versatile": 0.59}.
+    # A deployment that does not price a model leaves it out, and the provider
+    # reports 0.0 rather than guessing.
+    #
+    # ``NoDecode`` stops pydantic-settings from JSON-parsing these before
+    # validation, so the blank-value case below is reachable instead of
+    # raising a SettingsError while the environment is being read.
+    COST_INPUT_PER_MTOK: Annotated[dict[str, float], NoDecode] = Field(default_factory=dict)
+    COST_OUTPUT_PER_MTOK: Annotated[dict[str, float], NoDecode] = Field(default_factory=dict)
 
     # --- Guardrails --------------------------------------------------------
     QUERY_MAX_CHARS: int = 2000
     TICKETS_DIR: str = "data/tickets"
 
     # --- Browser access ----------------------------------------------------
-    # Origins allowed to call the API from a page served elsewhere. Only the
-    # bundled demo page needs this: it is same-origin, so this exists purely so
-    # a UI can be developed on a different port. Set to an empty string to
-    # disable CORS entirely, which is what a real deployment should do.
+    # Origins allowed to call the API directly from a page. The Next.js
+    # frontend proxies through its own server, so production needs none of
+    # these: set CORS_ALLOWED_ORIGINS to an empty string to disable CORS
+    # entirely, which is the correct production posture.
     CORS_ALLOWED_ORIGINS: str = (
         "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8000,http://127.0.0.1:8000"
     )
@@ -99,6 +172,23 @@ class Settings(BaseSettings):
     @classmethod
     def _upper_log_level(cls, value: str) -> str:
         return value.upper()
+
+    @field_validator("COST_INPUT_PER_MTOK", "COST_OUTPUT_PER_MTOK", mode="before")
+    @classmethod
+    def _blank_cost_map_is_no_rates(cls, value: object) -> object:
+        """Treat an unset cost map as "no rates" rather than a validation error.
+
+        The natural way to write "this deployment prices nothing" in an env
+        file is to leave the line blank, and a blank string is not a valid
+        ``dict[str, float]``. Without this, `cp .env.example .env` would stop
+        the service from starting — a failure that only ever shows up on a
+        genuinely new clone, never on a working one.
+        """
+        if value is None:
+            return {}
+        if isinstance(value, str) and not value.strip():
+            return {}
+        return value
 
     @property
     def fallback_chain(self) -> list[str]:
