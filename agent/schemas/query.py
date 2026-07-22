@@ -21,6 +21,16 @@ class QueryRequest(BaseModel):
         max_length=128,
         description="Optional caller-supplied conversation id, for client-side history.",
     )
+    conversation_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "Anchor conversation to append this turn to. The question and the "
+            "answer, with the model, latency, tokens, cost, sources and tool "
+            "calls that produced it, are stored against it. Must be a "
+            "conversation in the caller's own workspace; anything else is a 404."
+        ),
+    )
     force_model: str | None = Field(
         default=None,
         max_length=120,

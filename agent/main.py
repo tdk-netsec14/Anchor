@@ -32,6 +32,66 @@ log = get_logger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 
 
+def validate_production_config() -> None:
+    """Refuse to start a production process that is not actually configured.
+
+    Every check here corresponds to something that would otherwise fail
+    quietly: no database means nobody can register and the development token
+    endpoint would be the only way in; local storage means uploaded documents
+    vanish on the next deploy; a weak pepper or a disabled pepper check means
+    stolen hashes are far cheaper to attack.
+
+    Raising at startup is deliberate. A process that boots and then behaves
+    insecurely is worse than one that refuses to boot, because the deploy looks
+    successful.
+    """
+    settings = get_settings()
+    if settings.ENVIRONMENT != "prod":
+        return
+
+    problems: list[str] = []
+
+    if not settings.DATABASE_URL.strip():
+        problems.append(
+            "DATABASE_URL is not set. Production Anchor is multi-tenant and needs a database; "
+            "run the migrations with `alembic upgrade head`."
+        )
+    elif settings.DATABASE_URL.startswith("sqlite"):
+        problems.append(
+            "DATABASE_URL points at SQLite. Use a managed PostgreSQL instance in production."
+        )
+
+    if settings.STORAGE_BACKEND != "s3":
+        problems.append(
+            f"STORAGE_BACKEND is '{settings.STORAGE_BACKEND}'. A container filesystem is wiped "
+            "on every deploy, so uploaded documents must live in object storage. Set it to 's3'."
+        )
+    elif not settings.S3_BUCKET.strip():
+        problems.append("STORAGE_BACKEND is 's3' but S3_BUCKET is not set.")
+
+    if not settings.CREDENTIAL_PEPPER.strip():
+        problems.append(
+            "CREDENTIAL_PEPPER is not set. Passwords are then protected by Argon2 alone, with no "
+            "server-side secret an attacker cannot reach."
+        )
+
+    if len(settings.JWT_SECRET) < 32:
+        problems.append("JWT_SECRET must be at least 32 characters in production.")
+
+    if settings.CORS_ALLOWED_ORIGINS.strip() == "*":
+        problems.append(
+            "CORS_ALLOWED_ORIGINS is '*'. Name the exact origins that may call the API."
+        )
+
+    if not problems:
+        return
+
+    raise RuntimeError(
+        "Anchor cannot start in production:\n"
+        + "\n".join(f"  - {problem}" for problem in problems)
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
@@ -40,6 +100,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "anchor.startup",
         context={"service": settings.APP_NAME, "env": settings.ENVIRONMENT},
     )
+    validate_production_config()
+
     # Open the vector store eagerly: it surfaces a misconfigured persist
     # directory or collection name at boot instead of on a user's first query.
     # Deliberately non-fatal - the process is still useful (and /health still
@@ -132,13 +194,28 @@ def create_app() -> FastAPI:
         )
         return response
 
-    from agent import auth
-    from agent.routers import health, ingest, metrics, query
+    from agent.routers import (
+        analytics,
+        api_keys,
+        auth,
+        conversations,
+        documents,
+        health,
+        ingest,
+        metrics,
+        query,
+        workspaces,
+    )
 
     app.include_router(auth.router)
     app.include_router(health.router)
     app.include_router(ingest.router)
+    app.include_router(documents.router)
     app.include_router(query.router)
+    app.include_router(conversations.router)
+    app.include_router(workspaces.router)
+    app.include_router(api_keys.router)
+    app.include_router(analytics.router)
     app.include_router(metrics.router)
 
     @app.exception_handler(HTTPException)

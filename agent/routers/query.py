@@ -14,26 +14,37 @@ exception never reaches the caller.
 
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy.orm import Session
 
-from agent.agent import AnchorAgent
-from agent.auth import CurrentUserDep
+from agent import rate_limit
+from agent.agent import AgentOutcome, AnchorAgent
+from agent.auth.principals import CurrentUser, CurrentUserDep
 from agent.config import get_settings
+from agent.db.access import scoped_one
+from agent.db.models import Conversation, Message, QueryUsage
+from agent.db.session import OptionalDbSession
 from agent.guardrails.input_guard import check_query
 from agent.observability.logger import get_logger, get_request_id
 from agent.observability.metrics import registry
-from agent.rag.retriever import Retriever
+from agent.rag.retriever import Retriever, ScopeError
+from agent.rate_limit import QUERY, check_daily_quota, principal_key
 from agent.routing.providers.base import ProviderError
 from agent.routing.router import AllProvidersFailed
 from agent.schemas.query import QueryRequest, QueryResponse
-from agent.tools.registry import ToolRegistry
+from agent.tools.registry import ToolContext, ToolRegistry
 
 router = APIRouter(tags=["query"])
 log = get_logger(__name__)
+
+#: The title a conversation carries until its first question replaces it.
+DEFAULT_TITLE = "New conversation"
 
 
 def build_tool_registry(
@@ -81,10 +92,14 @@ def get_agent() -> AnchorAgent:
     response_model=QueryResponse,
     summary="Ask the knowledge base a question",
     description=(
-        "Retrieves relevant passages, routes the question to an appropriate "
-        "model, lets it call tools, and returns a grounded, cited answer.\n\n"
-        "Requires a bearer token. When no provider can serve the request the "
-        "call fails with 503 rather than returning a partial answer."
+        "Retrieves relevant passages from the caller's workspace, routes the "
+        "question to an appropriate model, lets it call tools, and returns a "
+        "grounded, cited answer.\n\n"
+        "Requires a bearer token. When `conversation_id` is supplied the turn "
+        "is appended to that conversation, along with the model, latency, "
+        "tokens, cost, sources and tool calls that produced it. When no "
+        "provider can serve the request the call fails with 503 rather than "
+        "returning a partial answer."
     ),
 )
 async def query(
@@ -92,7 +107,12 @@ async def query(
     payload: QueryRequest,
     user: CurrentUserDep,
     agent: Annotated[AnchorAgent, Depends(get_agent)],
+    db: OptionalDbSession,
 ) -> QueryResponse:
+    rate_limit.limiter.check(principal_key(request, user.user_id), QUERY)
+    if user.workspace_id:
+        check_daily_quota(user.workspace_id)
+
     check = check_query(payload.query)
     if not check.allowed:
         raise HTTPException(
@@ -104,10 +124,33 @@ async def query(
             },
         )
 
+    tool_context = ToolContext(
+        workspace_id=user.workspace_id,
+        user_id=user.user_id,
+        user_email=user.email or "",
+        request_id=getattr(request.state, "request_id", "") or "",
+        role=user.workspace_role.value if user.workspace_role else "",
+    )
+
     try:
-        outcome = await agent.answer(payload.query, force_model=payload.force_model)
+        outcome = await agent.answer(
+            payload.query,
+            force_model=payload.force_model,
+            workspace_id=user.workspace_id,
+            tool_context=tool_context,
+        )
+    except ScopeError as exc:
+        # Only reachable when a database exists but the credential named no
+        # workspace, which the auth layer already prevents. Treated as a
+        # server misconfiguration rather than a user error.
+        log.error("query.unscoped_retrieval_refused", context={"user_id": user.user_id})
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "no_workspace", "message": str(exc)},
+        ) from exc
     except AllProvidersFailed as exc:
         log.error("query.all_providers_failed", context={"query_length": len(payload.query)})
+        _record_usage(db, user, payload, request, error_type="all_providers_failed")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
@@ -134,6 +177,7 @@ async def query(
             context={"error_type": type(exc).__name__},
             exc_info=True,
         )
+        _record_usage(db, user, payload, request, error_type=type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={
@@ -146,6 +190,7 @@ async def query(
     except Exception as exc:  # noqa: BLE001 - the boundary must not leak internals
         registry.record_error(type(exc).__name__)
         log.error("query.unhandled_error", context={"error_type": type(exc).__name__}, exc_info=True)
+        _record_usage(db, user, payload, request, error_type=type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
@@ -190,6 +235,8 @@ async def query(
         },
     )
 
+    _persist_turn(db, user, payload, request, outcome)
+
     return QueryResponse(
         answer=outcome.answer,
         sources=outcome.sources,
@@ -208,3 +255,124 @@ async def query(
         fallbacks=outcome.fallbacks,
         session_id=payload.session_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+def _record_usage(
+    db: Session | None,
+    user: CurrentUser,
+    payload: QueryRequest,
+    request: Request,
+    *,
+    error_type: str | None = None,
+) -> None:
+    """Append one `query_usage` row, best-effort.
+
+    A failure to record usage must not turn a served answer into an error, so
+    this swallows its own exceptions and logs. It is a no-op without a
+    database, which is the development path.
+    """
+    if db is None or not user.workspace_id:
+        return
+    try:
+        db.add(
+            QueryUsage(
+                workspace_id=user.workspace_id,
+                user_id=user.user_id,
+                request_id=getattr(request.state, "request_id", None) or "",
+                model_used="",
+                provider="",
+                error_type=error_type,
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        log.warning("query.usage_record_failed", context={"error_type": type(error_type).__name__})
+
+
+def _persist_turn(
+    db: Session | None,
+    user: CurrentUser,
+    payload: QueryRequest,
+    request: Request,
+    outcome: AgentOutcome,
+) -> None:
+    """Store the turn: the usage row, and both messages when a conversation
+    was named.
+
+    Best-effort throughout, for the same reason as :func:`_record_usage`. The
+    question text is stored — it is the user's own words in their own
+    workspace, and it is what makes the conversation history work.
+    """
+    if db is None or not user.workspace_id:
+        return
+
+    request_id = getattr(request.state, "request_id", None) or ""
+    conversation_id = payload.conversation_id
+    try:
+        db.add(
+            QueryUsage(
+                workspace_id=user.workspace_id,
+                user_id=user.user_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                model_used=outcome.model_used,
+                provider=outcome.provider,
+                routing_reason=outcome.routing_reason,
+                prompt_tokens=outcome.prompt_tokens,
+                completion_tokens=outcome.completion_tokens,
+                cost_usd=outcome.cost_usd,
+                latency_ms=outcome.latency_ms,
+                sources_count=len(outcome.sources),
+                tool_calls_json=json.dumps(
+                    [
+                        {"name": t.name, "ok": t.ok, "latency_ms": t.latency_ms}
+                        for t in outcome.tool_calls
+                    ]
+                ),
+                guardrail_flags_json=json.dumps(outcome.guardrail_flags),
+                used_fallback=bool(outcome.fallbacks),
+            )
+        )
+        if conversation_id:
+            conversation = scoped_one(db, Conversation, conversation_id, user, what="conversation")
+            db.add(
+                Message(
+                    conversation_id=conversation.id,
+                    workspace_id=conversation.workspace_id,
+                    role="user",
+                    content=payload.query,
+                )
+            )
+            db.add(
+                Message(
+                    conversation_id=conversation.id,
+                    workspace_id=conversation.workspace_id,
+                    role="assistant",
+                    content=outcome.answer,
+                    model_used=outcome.model_used,
+                    provider=outcome.provider,
+                    latency_ms=outcome.latency_ms,
+                    prompt_tokens=outcome.prompt_tokens,
+                    completion_tokens=outcome.completion_tokens,
+                    cost_usd=outcome.cost_usd,
+                    request_id=request_id,
+                    sources_json=json.dumps(
+                        [d.model_dump() for d in outcome.source_details]
+                    ),
+                    tool_calls_json=json.dumps([t.model_dump() for t in outcome.tool_calls]),
+                    guardrail_flags_json=json.dumps(outcome.guardrail_flags),
+                )
+            )
+            conversation.updated_at = datetime.now(UTC)
+            if conversation.title == DEFAULT_TITLE:
+                # First question names the thread, so the sidebar is not a
+                # column of "New conversation".
+                conversation.title = payload.query.strip()[:80] or DEFAULT_TITLE
+        db.commit()
+    except Exception:
+        db.rollback()
+        log.warning("query.turn_persist_failed", context={"error_type": "persist"}, exc_info=True)
