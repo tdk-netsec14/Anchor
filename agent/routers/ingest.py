@@ -1,28 +1,43 @@
 """``POST /ingest`` — upload a PDF into the knowledge base.
 
-Admin only. Writing to the shared knowledge base is the one operation a normal
-support user must never perform, so the route is gated by ``require_role``
-rather than relying on the client to hide the button.
+Two modes, chosen by whether a database is configured:
+
+**With a database** (every real deployment). The request validates the upload,
+writes the bytes to object storage, creates a `documents` row in state `QUEUED`
+and an `ingestion_jobs` row, and returns. Extraction, OCR, embedding and
+indexing happen in the background worker. The caller's connection is not held
+open for the tens of seconds that work takes.
+
+**Without one** (the original development path). The request ingests
+synchronously and returns the counts directly. There is no database, so there
+are no tenants, no ownership and no job to hand work to.
+
+Both write to the same vector store with the same chunking, and both are gated
+by role: writing to the knowledge base is the one thing a read-only member must
+never be able to do.
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
-from agent.auth import CurrentUserDep, require_role
+from agent import audit, rate_limit
+from agent.auth.principals import CurrentUser, require_active_workspace, require_role
 from agent.config import get_settings
+from agent.db.models import Document, DocumentStatus, IngestionJob
+from agent.db.session import OptionalDbSession
 from agent.observability.logger import get_logger
 from agent.observability.metrics import registry
+from agent.rate_limit import INGEST, principal_key
 from agent.schemas.ingest import IngestResponse
+from agent.storage import StorageError, build_key, get_storage
 from ingestion.ocr import OcrUnavailableError, PdfExtractionError
-from ingestion.pipeline import (
-    EmptyDocumentError,
-    IngestionError,
-    ingest_document,
-)
+from ingestion.pipeline import EmptyDocumentError, IngestionError, ingest_document
 from ingestion.vector_store import VectorStoreError, get_vector_store
 
 router = APIRouter(tags=["ingestion"])
@@ -74,29 +89,11 @@ async def _read_limited(upload: UploadFile, max_bytes: int) -> bytes:
     return bytes(buffer)
 
 
-@router.post(
-    "/ingest",
-    response_model=IngestResponse,
-    summary="Upload and index a PDF (admin only)",
-    description=(
-        "Runs the uploaded PDF through text extraction (OCR where the page has "
-        "no text layer), chunking, local embedding and ChromaDB storage.\n\n"
-        "Requires the `admin` role. Re-uploading a document with the same name "
-        "replaces its previous chunks."
-    ),
-    dependencies=[Depends(require_role("admin"))],
-)
-async def ingest_pdf(
-    file: Annotated[UploadFile, File(description="PDF file to index.")],
-    doc_name: Annotated[
-        str | None,
-        Form(description="Optional override for the indexed document name."),
-    ] = None,
-) -> IngestResponse:
+async def _validate_upload(upload: UploadFile, override: str | None) -> tuple[str, bytes]:
+    """Check name, size and magic bytes. Shared by both modes."""
     settings = get_settings()
-    max_bytes = settings.MAX_UPLOAD_MB * 1024 * 1024
-    name = _safe_doc_name(file, doc_name)
-    data = await _read_limited(file, max_bytes)
+    name = _safe_doc_name(upload, override)
+    data = await _read_limited(upload, settings.MAX_UPLOAD_MB * 1024 * 1024)
 
     if not data:
         raise HTTPException(
@@ -111,7 +108,50 @@ async def ingest_pdf(
                 "message": "The uploaded file is not a PDF (missing %PDF header).",
             },
         )
+    return name, data
 
+
+@router.post(
+    "/ingest",
+    response_model=IngestResponse,
+    summary="Upload and index a PDF",
+    description=(
+        "Stores the PDF and indexes it: text extraction (OCR where the page has "
+        "no text layer), chunking, local embedding and vector storage.\n\n"
+        "With a database configured the response returns as soon as the file is "
+        'stored, with `status="queued"`; a background worker does the rest and '
+        "the document moves through `processing` to `indexed` or `failed`. "
+        "Without one, the request ingests synchronously.\n\n"
+        "Requires the `admin` role, or OWNER/ADMIN in the active workspace. "
+        "Re-uploading a name that already exists in this workspace replaces the "
+        "previous version."
+    ),
+)
+async def ingest_pdf(
+    request: Request,
+    user: Annotated[CurrentUser, Depends(require_role("admin"))],
+    db: OptionalDbSession,
+    file: Annotated[UploadFile, File(description="PDF file to index.")],
+    doc_name: Annotated[
+        str | None,
+        Form(description="Optional override for the indexed document name."),
+    ] = None,
+) -> IngestResponse:
+    rate_limit.limiter.check(principal_key(request, user.user_id), INGEST)
+    name, data = await _validate_upload(file, doc_name)
+
+    if db is None:
+        # No database means no tenants, so there is no workspace to require and
+        # nothing to own the document. The role check above is the only gate.
+        return await _ingest_synchronously(data, name)
+
+    # With a database the document is a tenant-owned row, so the workspace must
+    # come from the credential. A demo token names none and is refused here.
+    return _queue_ingestion(db, user, require_active_workspace(user), name, data)
+
+
+async def _ingest_synchronously(data: bytes, name: str) -> IngestResponse:
+    """The original path: do the whole pipeline inside the request."""
     try:
         # Parsing, OCR, embedding and the Chroma write are all synchronous and
         # can take seconds. Running them on the event loop would stall every
@@ -151,66 +191,123 @@ async def ingest_pdf(
     return IngestResponse(**result.to_dict())  # type: ignore[arg-type]
 
 
-@router.get(
-    "/documents",
-    summary="List indexed knowledge base documents",
-    description="Returns all unique documents indexed in ChromaDB with chunk and page counts. Requires authentication.",
-)
-async def list_documents(user: CurrentUserDep) -> dict[str, Any]:
-    store = get_vector_store()
+def _queue_ingestion(
+    db,  # noqa: ANN001
+    user: CurrentUser,
+    workspace_id: str,
+    name: str,
+    data: bytes,
+) -> IngestResponse:
+    """Store the file and queue the work. Returns without indexing anything."""
+
+    # Re-upload replaces. The old row is removed here rather than updated so
+    # the new document gets a fresh id, a fresh storage key, and — crucially —
+    # chunk ids that cannot collide with the previous version's.
+    previous = db.execute(
+        select(Document).where(Document.workspace_id == workspace_id, Document.name == name)
+    ).scalars().one_or_none()
+    replaced = previous is not None
+    if previous is not None:
+        _purge_document_files(previous)
+        db.delete(previous)
+        db.flush()
+
+    document = Document(
+        workspace_id=workspace_id,
+        uploaded_by_user_id=user.user_id,
+        name=name,
+        # Filled in below, once the id exists to key it by.
+        storage_key="pending",
+        content_type="application/pdf",
+        size_bytes=len(data),
+        status=DocumentStatus.QUEUED,
+    )
+    db.add(document)
+    db.flush()
+
+    document.storage_key = build_key(workspace_id, document.id, name)
     try:
-        data = store.collection.get(include=["metadatas"])
-        metadatas = data.get("metadatas") or []
-        docs_map: dict[str, dict[str, Any]] = {}
-        for m in metadatas:
-            if not m:
-                continue
-            doc_name = m.get("doc_name", "unknown")
-            page = m.get("page_number")
-            ocr = m.get("ocr_used", False)
-            if doc_name not in docs_map:
-                docs_map[doc_name] = {
-                    "doc_name": doc_name,
-                    "chunks": 0,
-                    "pages": set(),
-                    "ocr_used": False,
-                }
-            docs_map[doc_name]["chunks"] += 1
-            if page:
-                docs_map[doc_name]["pages"].add(page)
-            if ocr:
-                docs_map[doc_name]["ocr_used"] = True
-
-        docs_list = [
-            {
-                "doc_name": k,
-                "chunks": v["chunks"],
-                "page_count": len(v["pages"]) if v["pages"] else 1,
-                "ocr_used": v["ocr_used"],
-            }
-            for k, v in sorted(docs_map.items())
-        ]
-        return {"documents": docs_list, "total_chunks": len(metadatas)}
-    except Exception:
-        log.error("documents.list_failed", exc_info=True)
-        return {"documents": [], "total_chunks": 0}
-
-
-@router.delete(
-    "/documents/{doc_name}",
-    summary="Delete a document from the knowledge base (admin only)",
-    description="Removes all chunks associated with the document from ChromaDB.",
-    dependencies=[Depends(require_role("admin"))],
-)
-async def delete_document(doc_name: str) -> dict[str, Any]:
-    store = get_vector_store()
-    try:
-        store.delete_document(doc_name)
-        return {"status": "deleted", "doc_name": doc_name}
-    except Exception as exc:
-        log.error("documents.delete_failed", context={"doc_name": doc_name}, exc_info=True)
+        get_storage().put(document.storage_key, data, "application/pdf")
+    except StorageError as exc:
+        db.rollback()
+        log.error("ingest.storage_failed", context={"doc_name": name}, exc_info=True)
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"error": "delete_failed", "message": f"Could not delete {doc_name}."},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "storage_unavailable",
+                "message": "The document could not be stored. Try again shortly.",
+            },
         ) from exc
 
+    db.add(IngestionJob(document_id=document.id, workspace_id=workspace_id))
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        # Two uploads of the same name raced. One wins; the other is told to
+        # retry, which is the honest answer.
+        db.rollback()
+        log.warning(
+            "ingest.name_conflict", context={"doc_name": name, "workspace_id": workspace_id}
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "document_exists",
+                "message": f"A document named '{name}' already exists in this workspace.",
+            },
+        ) from exc
+
+    audit.record_event(
+        db,
+        action="document.upload",
+        actor_email=user.email or "",
+        user_id=user.user_id,
+        workspace_id=workspace_id,
+        target_type="document",
+        target_id=document.id,
+        detail={"name": name, "size_bytes": len(data), "replaced": replaced},
+    )
+    log.info(
+        "ingest.queued",
+        context={
+            "document_id": document.id,
+            "workspace_id": workspace_id,
+            "doc_name": name,
+            "size_bytes": len(data),
+            "replaced": replaced,
+        },
+    )
+
+    return IngestResponse(
+        doc_name=name,
+        chunks_created=0,
+        status="queued",
+        document_id=document.id,
+        document_status=DocumentStatus.QUEUED,
+        replaced_existing=replaced,
+    )
+
+
+def _purge_document_files(document) -> None:  # noqa: ANN001
+    """Remove a document's stored bytes and its indexed chunks.
+
+    Both are best-effort. A failure here is logged and the caller still
+    removes the row, because a database row pointing at a missing object is
+    worse than an orphaned object nobody references.
+    """
+    try:
+        get_storage().delete(document.storage_key)
+    except StorageError:
+        log.warning(
+            "documents.storage_delete_failed",
+            context={"document_id": document.id},
+            exc_info=True,
+        )
+    try:
+        get_vector_store().delete_document_id(document.id)
+    except VectorStoreError:
+        log.warning(
+            "documents.vector_delete_failed",
+            context={"document_id": document.id},
+            exc_info=True,
+        )

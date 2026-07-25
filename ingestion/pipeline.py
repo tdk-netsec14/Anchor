@@ -57,6 +57,8 @@ def build_chunks(
     doc_name: str,
     *,
     use_model_tokenizer: bool = True,
+    workspace_id: str | None = None,
+    document_id: str | None = None,
 ) -> list[Chunk]:
     """Chunk extracted pages using the embedding model's own tokenizer.
 
@@ -102,6 +104,8 @@ def build_chunks(
         chunk_size=chunk_size,
         chunk_overlap=overlap,
         span_fn=span_fn,
+        workspace_id=workspace_id,
+        document_id=document_id,
     )
 
 
@@ -110,8 +114,15 @@ def ingest_document(
     doc_name: str,
     *,
     replace_existing: bool = True,
+    workspace_id: str | None = None,
+    document_id: str | None = None,
 ) -> IngestResult:
-    """Run one document through extract -> chunk -> embed -> store."""
+    """Run one document through extract -> chunk -> embed -> store.
+
+    ``workspace_id`` and ``document_id`` are stamped onto every chunk. They
+    are what makes retrieval and deletion tenant-scoped, so a deployment with a
+    database always supplies them; the API refuses to ingest without one.
+    """
     settings = get_settings()
     store = get_vector_store()
     # Open the native Chroma extension before any embedding model is loaded;
@@ -131,7 +142,7 @@ def ingest_document(
     if not pages:
         raise EmptyDocumentError("The document contains no pages.")
 
-    chunks = build_chunks(pages, doc_name)
+    chunks = build_chunks(pages, doc_name, workspace_id=workspace_id, document_id=document_id)
     if not chunks:
         raise EmptyDocumentError(
             "No text could be extracted from this document. If it is a scan, "
@@ -146,11 +157,14 @@ def ingest_document(
         # be counted before the delete: after it, the collection total says
         # nothing about whether this file was already indexed.
         try:
-            replaced = store.count_documents(doc_name) > 0
+            replaced = store.count_documents(doc_name, workspace_id) > 0
         except VectorStoreError as exc:
             log.warning("ingestion.count_failed", context={"reason": type(exc).__name__})
         try:
-            store.delete_document(doc_name)
+            if document_id:
+                store.delete_document_id(document_id)
+            else:
+                store.delete_document(doc_name, workspace_id)
         except VectorStoreError as exc:  # deleting from an empty store is not an error
             log.warning("ingestion.delete_skipped", context={"reason": type(exc).__name__})
 
@@ -170,6 +184,7 @@ def ingest_document(
         "ingestion.completed",
         context={
             "doc_name": doc_name,
+            "workspace_id": workspace_id,
             "chunks_created": written,
             "pages": len(pages),
             "ocr_pages": result.pages_using_ocr,
