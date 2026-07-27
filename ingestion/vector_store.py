@@ -31,6 +31,26 @@ log = get_logger(__name__)
 _VALID_COLLECTION_NAME = re.compile(r"^[A-Za-z0-9._-]{3,512}$")
 
 
+def _scope(filters: dict[str, Any] | None, workspace_id: str | None) -> dict[str, Any] | None:
+    """Combine a caller's filters with the tenant filter.
+
+    Chroma needs ``$and`` to express "this document *in this workspace*". The
+    tenant condition is added here rather than at each call site so there is a
+    single place where it could be forgotten, and so ``None`` is the only way
+    to search across tenants.
+    """
+    conditions: list[dict[str, Any]] = []
+    if workspace_id:
+        conditions.append({"workspace_id": workspace_id})
+    if filters:
+        conditions.append(filters)
+    if not conditions:
+        return None
+    if len(conditions) == 1:
+        return conditions[0]
+    return {"$and": conditions}
+
+
 class VectorStoreError(RuntimeError):
     """The vector store could not be reached or queried."""
 
@@ -109,8 +129,7 @@ class VectorStore:
                         )
                     except Exception as exc:
                         raise VectorStoreError(
-                            f"Could not open the ChromaDB collection "
-                            f"'{self.collection_name}'."
+                            f"Could not open the ChromaDB collection '{self.collection_name}'."
                         ) from exc
         return self._collection
 
@@ -141,22 +160,36 @@ class VectorStore:
             raise VectorStoreError("Failed to write chunks to the vector store.") from exc
         return len(chunks)
 
-    def count_documents(self, doc_name: str) -> int:
-        """How many chunks belong to one document."""
+    def count_documents(self, doc_name: str, workspace_id: str | None = None) -> int:
+        """How many chunks belong to one document, within one workspace."""
         try:
             return len(
-                self.collection.get(where={"doc_name": doc_name}, include=[]).get("ids") or []
+                self.collection.get(
+                    where=_scope({"doc_name": doc_name}, workspace_id), include=[]
+                ).get("ids")
+                or []
             )
         except Exception as exc:
-            raise VectorStoreError(
-                f"Could not count chunks for document '{doc_name}'."
-            ) from exc
+            raise VectorStoreError(f"Could not count chunks for document '{doc_name}'.") from exc
 
-    def delete_document(self, doc_name: str) -> None:
+    def delete_document(self, doc_name: str, workspace_id: str | None = None) -> None:
+        """Delete every chunk of one document, scoped to its workspace.
+
+        Scoping the filter to the workspace is what stops a delete issued by
+        one tenant from removing a same-named document belonging to another.
+        """
         try:
-            self.collection.delete(where={"doc_name": doc_name})
+            self.collection.delete(where=_scope({"doc_name": doc_name}, workspace_id))
         except Exception as exc:
             raise VectorStoreError(f"Failed to delete document '{doc_name}'.") from exc
+
+    def delete_document_id(self, document_id: str) -> None:
+        """Delete by `documents` row id. The precise form, used by the worker
+        and by document deletion, where a name may have been reused."""
+        try:
+            self.collection.delete(where={"document_id": document_id})
+        except Exception as exc:
+            raise VectorStoreError("Failed to delete the document's chunks.") from exc
 
     # -- reads -------------------------------------------------------------
     def query(
@@ -164,8 +197,16 @@ class VectorStore:
         embedding: Sequence[float],
         top_k: int = 4,
         doc_name: str | None = None,
+        workspace_id: str | None = None,
     ) -> list[RetrievedChunk]:
-        """Cosine-similarity search. Returns [] when the store is empty."""
+        """Cosine-similarity search within one workspace.
+
+        ``workspace_id`` is the tenant filter and is the reason two tenants
+        cannot read each other's documents: it is applied by the database, not
+        by discarding results afterwards, so an unscoped chunk can never reach
+        the caller even in principle. Passing ``None`` searches the whole
+        collection, which the API only permits when no database is configured.
+        """
         try:
             count = self.collection.count()
         except VectorStoreError:
@@ -175,7 +216,7 @@ class VectorStore:
         if count == 0:
             return []
 
-        where = {"doc_name": doc_name} if doc_name else None
+        where = _scope({"doc_name": doc_name} if doc_name else None, workspace_id)
         n_results = max(1, min(top_k, count))
         try:
             result = self.collection.query(
@@ -211,6 +252,45 @@ class VectorStore:
             return int(self.collection.count())
         except Exception as exc:
             raise VectorStoreError("Could not read the vector store size.") from exc
+
+    def list_documents(self, workspace_id: str | None = None) -> list[dict[str, Any]]:
+        """Summarise the indexed documents visible to one workspace.
+
+        Reads only chunk metadata. Used as a cross-check against the
+        `documents` table, which is the authoritative list; a name present
+        here but not there means a chunk outlived its row, which is worth
+        seeing on the health endpoint.
+        """
+        try:
+            data = self.collection.get(where=_scope(None, workspace_id), include=["metadatas"])
+        except Exception as exc:
+            raise VectorStoreError("Could not list documents in the vector store.") from exc
+
+        docs: dict[str, dict[str, Any]] = {}
+        for metadata in data.get("metadatas") or []:
+            if not metadata:
+                continue
+            name = metadata.get("doc_name", "unknown")
+            entry = docs.setdefault(
+                name,
+                {"doc_name": name, "chunks": 0, "pages": set(), "ocr_used": False},
+            )
+            entry["chunks"] += 1
+            page = metadata.get("page_number")
+            if page:
+                entry["pages"].add(page)
+            if metadata.get("used_ocr") or metadata.get("ocr_used"):
+                entry["ocr_used"] = True
+
+        return [
+            {
+                "doc_name": key,
+                "chunks": value["chunks"],
+                "page_count": len(value["pages"]) or 1,
+                "ocr_used": value["ocr_used"],
+            }
+            for key, value in sorted(docs.items())
+        ]
 
     def health(self) -> dict[str, Any]:
         """Non-throwing probe used by ``GET /health``."""

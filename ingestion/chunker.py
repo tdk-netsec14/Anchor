@@ -62,6 +62,13 @@ class Chunk:
     page_number: int
     text: str
     token_count: int = 0
+    #: Owning tenant. ``None`` only in the unscoped development collection;
+    #: a deployment with a database always populates it, and every retrieval
+    #: filters on it.
+    workspace_id: str | None = None
+    #: The `documents` row this chunk came from. Distinguishes two uploads of
+    #: the same name that were never deleted.
+    document_id: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_chroma_metadata(self) -> dict[str, str | int | float | bool]:
@@ -75,16 +82,33 @@ class Chunk:
             "chunk_id": self.chunk_id,
             "page_number": int(self.page_number),
         }
+        if self.workspace_id:
+            metadata["workspace_id"] = self.workspace_id
+        if self.document_id:
+            metadata["document_id"] = self.document_id
         metadata.update(
             {k: v for k, v in self.extra.items() if isinstance(v, (str, int, float, bool))}
         )
         return metadata
 
 
-def make_chunk_id(doc_name: str, page_number: int, index: int) -> str:
+def make_chunk_id(
+    doc_name: str,
+    page_number: int,
+    index: int,
+    *,
+    workspace_id: str | None = None,
+    document_id: str | None = None,
+) -> str:
     """Deterministic id so re-ingesting a document overwrites rather than
-    duplicates its chunks."""
-    return f"{doc_name}#p{page_number}#c{index}"
+    duplicates its chunks.
+
+    The tenant and document ids are part of the key. Without them two
+    workspaces that each hold an "HR Leave Policy.pdf" would write to the same
+    chunk ids, and one workspace's upload would silently replace the other's.
+    """
+    scope = f"{workspace_id}/{document_id}/" if workspace_id and document_id else ""
+    return f"{scope}{doc_name}#p{page_number}#c{index}"
 
 
 def chunk_pages(
@@ -94,6 +118,8 @@ def chunk_pages(
     chunk_size: int = 500,
     chunk_overlap: int = 50,
     span_fn: Callable[[str], list[tuple[int, int]]] | None = None,
+    workspace_id: str | None = None,
+    document_id: str | None = None,
 ) -> list[Chunk]:
     """Split pages into overlapping chunks of roughly ``chunk_size`` tokens.
 
@@ -121,19 +147,25 @@ def chunk_pages(
             window = spans[start : start + chunk_size]
             if not window:
                 break
-            char_start, char_end = _snap_to_word_boundaries(
-                page.text, window[0][0], window[-1][1]
-            )
+            char_start, char_end = _snap_to_word_boundaries(page.text, window[0][0], window[-1][1])
             text = page.text[char_start:char_end].strip()
             if not text:
                 continue
             chunks.append(
                 Chunk(
-                    chunk_id=make_chunk_id(doc_name, page.page_number, start // step),
+                    chunk_id=make_chunk_id(
+                        doc_name,
+                        page.page_number,
+                        start // step,
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                    ),
                     doc_name=doc_name,
                     page_number=page.page_number,
                     text=text,
                     token_count=len(window),
+                    workspace_id=workspace_id,
+                    document_id=document_id,
                     extra={"used_ocr": page.ocr_used},
                 )
             )

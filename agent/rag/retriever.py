@@ -22,6 +22,29 @@ log = get_logger(__name__)
 #: and, worse, they tempt the model to answer from irrelevant context.
 MIN_RELEVANCE_SCORE = 0.05
 
+
+class ScopeError(RuntimeError):
+    """Retrieval was attempted without a workspace when one is required."""
+
+
+def require_workspace_scope(workspace_id: str | None) -> str | None:
+    """Return the workspace to scope retrieval to, or refuse.
+
+    A deployment with a database is multi-tenant, so an unscoped search would
+    cross tenants and is refused outright. A deployment *without* a database
+    has no tenants — the only way to authenticate is the development token — so
+    the unscoped collection is the whole world and filtering it by a workspace
+    nobody belongs to would return nothing.
+    """
+    if workspace_id:
+        return workspace_id
+    from agent.db.session import database_configured
+
+    if database_configured():
+        raise ScopeError("Retrieval requires a workspace scope, and the caller supplied none.")
+    return None
+
+
 @dataclass(slots=True)
 class RetrievalResult:
     query: str
@@ -46,19 +69,26 @@ class Retriever:
         top_k: int | None = None,
         min_score: float = MIN_RELEVANCE_SCORE,
         doc_name: str | None = None,
+        workspace_id: str | None = None,
     ) -> RetrievalResult:
-        """Return the chunks most relevant to ``query``.
+        """Return the chunks most relevant to ``query``, within one workspace.
 
         Returns an empty result (never raises) when the knowledge base is
         empty; callers decide whether that is a refusal or an error.
         """
+        scope = require_workspace_scope(workspace_id)
         store = get_vector_store()
         embedder = get_embedder()
         vector = embedder.embed_query(query)
 
         # Over-fetch, then trim. Filtering after the fact means the marginal
         # chunk that fails the threshold does not consume a top-k slot.
-        hits = store.query(vector, top_k=max(top_k or self.top_k, self.top_k) * 2, doc_name=doc_name)
+        hits = store.query(
+            vector,
+            top_k=max(top_k or self.top_k, self.top_k) * 2,
+            doc_name=doc_name,
+            workspace_id=scope,
+        )
         keep = [h for h in hits if h.score >= min_score][: (top_k or self.top_k)]
 
         result = RetrievalResult(
@@ -69,6 +99,7 @@ class Retriever:
         log.info(
             "retrieval.completed",
             context={
+                "workspace_id": scope,
                 "returned": len(keep),
                 "candidates": len(hits),
                 "top_score": round(result.top_score, 4),
