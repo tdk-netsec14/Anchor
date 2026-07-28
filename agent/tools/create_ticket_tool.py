@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from agent.config import get_settings
 from agent.observability.logger import get_logger
-from agent.tools.registry import Tool, ToolError
+from agent.tools.registry import Tool, ToolContext, ToolError
 
 log = get_logger(__name__)
 
@@ -77,7 +77,7 @@ class CreateTicketTool(Tool):
     def tickets_dir(self) -> Path:
         return Path(self._tickets_dir or get_settings().TICKETS_DIR)
 
-    def run(self, **kwargs: Any) -> str:
+    def run(self, context: ToolContext, **kwargs: Any) -> str:
         summary = kwargs["summary"]
         priority = kwargs["priority"]
 
@@ -88,6 +88,10 @@ class CreateTicketTool(Tool):
             "summary": summary,
             "status": "open",
             "source": "anchor-agent",
+            # Stamped so an escalation can be traced to the workspace that
+            # raised it, even on the local-filesystem development backend.
+            "workspace_id": context.workspace_id,
+            "requested_by": context.user_email or context.user_id,
             # Not a real integration - make that obvious to anyone reading the file.
             "simulated": True,
         }

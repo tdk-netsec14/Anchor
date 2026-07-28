@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 from starlette.concurrency import run_in_threadpool
@@ -29,7 +30,7 @@ from agent.routing.providers.base import Message, ProviderError, ToolCall
 from agent.routing.router import AllProvidersFailed, ModelRouter, RoutingDecision
 from agent.schemas.query import SourceDetail, ToolCallRecord
 from agent.tools.parsing import parse_text_tool_calls
-from agent.tools.registry import ToolRegistry
+from agent.tools.registry import ToolContext, ToolRegistry
 
 log = get_logger(__name__)
 
@@ -82,9 +83,23 @@ class AnchorAgent:
         self.retriever = retriever or Retriever()
 
     # -- public API --------------------------------------------------------
-    async def answer(self, query: str, *, force_model: str | None = None) -> AgentOutcome:
+    async def answer(
+        self,
+        query: str,
+        *,
+        force_model: str | None = None,
+        workspace_id: str | None = None,
+        tool_context: ToolContext | None = None,
+    ) -> AgentOutcome:
+        """Answer one question inside one workspace.
+
+        ``workspace_id`` scopes retrieval. It is optional only because the
+        development path has no tenancy at all; a deployment with a database
+        refuses an unscoped search inside the retriever.
+        """
         settings = get_settings()
         started = time.perf_counter()
+        context = tool_context or ToolContext(workspace_id=workspace_id)
 
         decision = self.router.route(query, force_model=force_model)
         log.info(
@@ -94,13 +109,16 @@ class AnchorAgent:
                 "tier": decision.tier,
                 "reason": decision.reason,
                 "forced": decision.forced,
+                "workspace_id": context.workspace_id,
             },
         )
 
         # Retrieval embeds the query and reads the store, and the tools re-enter
         # the same path. Both are synchronous and CPU-bound, so they run in a
         # worker thread rather than on the event loop.
-        result = await run_in_threadpool(self.retriever.retrieve, query)
+        result = await run_in_threadpool(
+            partial(self.retriever.retrieve, workspace_id=context.workspace_id), query
+        )
         context_block = build_context(result.chunks)
         allowed_tags = self._allowed_source_tags(result)
 
@@ -173,7 +191,7 @@ class AnchorAgent:
             last_content = response.content
 
             # -- execute requested tools ---------------------------------
-            await self._run_tool_round(effective_tool_calls, messages, outcome)
+            await self._run_tool_round(effective_tool_calls, messages, outcome, context)
 
             log.info(
                 "agent.tool_iteration",
@@ -207,6 +225,7 @@ class AnchorAgent:
         calls: list[ToolCall],
         messages: list[Message],
         outcome: AgentOutcome,
+        context: ToolContext,
     ) -> None:
         """Execute one round of tool calls and feed the results back.
 
@@ -215,7 +234,7 @@ class AnchorAgent:
         point of the registry returning a reason instead of raising.
         """
         for call in calls:
-            result = await run_in_threadpool(self.tools.execute, call)
+            result = await run_in_threadpool(partial(self.tools.execute, context=context), call)
             outcome.tool_calls.append(
                 ToolCallRecord(
                     name=call.name,

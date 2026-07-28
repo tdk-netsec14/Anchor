@@ -18,7 +18,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from agent.tools.registry import Tool, ToolError
+from agent.tools.registry import Tool, ToolContext, ToolError
 
 #: Longest expression accepted. Bounds the parse cost and log noise.
 MAX_EXPRESSION_LENGTH = 200
@@ -42,6 +42,7 @@ _UNARY_OPS: dict[type[ast.unaryop], Any] = {
     ast.UAdd: operator.pos,
     ast.USub: operator.neg,
 }
+
 
 def _safe_round(value: float, ndigits: float = 0) -> float:
     """``round`` requires an int for ndigits, but every literal here is a float."""
@@ -171,8 +172,12 @@ class CalculatorTool(Tool):
     )
     args_model = CalculatorArgs
 
-    def run(self, **kwargs: Any) -> str:
+    def run(self, context: ToolContext, **kwargs: Any) -> str:
+        # Pure arithmetic on model-supplied text: no tenant data, so the
+        # context is accepted and ignored.
         value = safe_calculate(kwargs["expression"])
         # Render integers without a trailing ".0" so 2*21 reads as "42".
-        rendered = str(int(value)) if value.is_integer() and abs(value) <= MAX_ABS_RESULT else repr(value)
+        rendered = (
+            str(int(value)) if value.is_integer() and abs(value) <= MAX_ABS_RESULT else repr(value)
+        )
         return f"{rendered} (from: {kwargs['expression']})"

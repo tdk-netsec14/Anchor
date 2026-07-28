@@ -39,6 +39,31 @@ class ToolResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class ToolContext:
+    """Who is asking, and on whose behalf.
+
+    Passed to every tool call rather than left ambient, so a tool that touches
+    tenant data has to state which tenant it is acting for. A tool that ignores
+    it — the calculator — still receives it, and one that uses it wrongly fails
+    visibly in review rather than silently reading across tenants.
+
+    ``workspace_id`` is ``None`` only on the development path, where there is no
+    database and therefore no tenancy.
+    """
+
+    workspace_id: str | None = None
+    user_id: str | None = None
+    user_email: str = ""
+    request_id: str = ""
+    #: The role the caller holds in ``workspace_id``.
+    role: str = ""
+
+
+#: Used when a tool is invoked outside a request — a script, or a test.
+UNSCOPED = ToolContext()
+
+
 class Tool(ABC):
     """A capability the model may invoke."""
 
@@ -63,6 +88,12 @@ class Tool(ABC):
     reference_pattern: str | None = None
     reference_label: str = "Reference"
 
+    #: When set, the registry refuses the call unless the context carries a
+    #: workspace. A tool that reads tenant data declares this, so a future
+    #: caller that forgets to pass a scope gets a recorded error rather than
+    #: unscoped access.
+    requires_workspace: bool = False
+
     def spec(self) -> ToolSpec:
         schema: dict[str, Any]
         if self.args_model is not None:
@@ -74,7 +105,7 @@ class Tool(ABC):
         return ToolSpec(name=self.name, description=self.description, parameters=schema)
 
     @abstractmethod
-    def run(self, **kwargs: Any) -> str | ToolResult:
+    def run(self, context: ToolContext, **kwargs: Any) -> str | ToolResult:
         """Execute the tool.
 
         Return a string for the model, or a :class:`ToolResult` when the tool
@@ -108,8 +139,7 @@ class Tool(ABC):
 
         if not isinstance(data, dict):
             raise ToolError(
-                f"Arguments for '{self.name}' must be a JSON object, "
-                f"got {type(data).__name__}."
+                f"Arguments for '{self.name}' must be a JSON object, got {type(data).__name__}."
             )
 
         if self.args_model is None:
@@ -152,8 +182,14 @@ class ToolRegistry:
         return [t.spec() for t in self._tools.values()]
 
     # -- execution ---------------------------------------------------------
-    def execute(self, call: ToolCall) -> ToolResult:
-        """Run one tool call, converting any failure into a result object."""
+    def execute(self, call: ToolCall, context: ToolContext | None = None) -> ToolResult:
+        """Run one tool call, converting any failure into a result object.
+
+        ``context`` is optional so a script or a test can call a tool directly.
+        A tool that declares ``requires_workspace`` refuses when it is missing,
+        which is what keeps tenant-scoped tools from working unscoped.
+        """
+        scope = context or UNSCOPED
         tool = self.get(call.name)
         if tool is None:
             log.warning("tool.unknown", context={"tool": call.name})
@@ -166,16 +202,28 @@ class ToolRegistry:
                 ),
             )
 
+        if tool.requires_workspace and not scope.workspace_id:
+            # Reported to the model as a tool error so it can recover, and to
+            # the log as an authorization event, because a model asking for
+            # unscoped access is worth knowing about.
+            log.warning(
+                "tool.workspace_required",
+                context={"tool": call.name, "user_id": scope.user_id},
+            )
+            return ToolResult(
+                name=call.name,
+                ok=False,
+                content="This tool needs an authenticated workspace and was called without one.",
+            )
+
         started = time.perf_counter()
         try:
             arguments = tool.parse_arguments(call.arguments)
-            raw = tool.run(**arguments)
+            raw = tool.run(scope, **arguments)
         except ToolError as exc:
             elapsed = (time.perf_counter() - started) * 1000
             log.warning("tool.rejected", context={"tool": call.name, "reason": str(exc)})
-            return ToolResult(
-                name=call.name, ok=False, content=str(exc), latency_ms=elapsed
-            )
+            return ToolResult(name=call.name, ok=False, content=str(exc), latency_ms=elapsed)
         except Exception as exc:
             elapsed = (time.perf_counter() - started) * 1000
             # Log the type, not the message: provider/tool exceptions can
@@ -193,7 +241,14 @@ class ToolRegistry:
             )
 
         elapsed = (time.perf_counter() - started) * 1000
-        log.info("tool.executed", context=tool_result_log(tool.name, elapsed))
+        log.info(
+            "tool.executed",
+            context={
+                **tool_result_log(tool.name, elapsed),
+                "workspace_id": scope.workspace_id,
+                "user_id": scope.user_id,
+            },
+        )
         if isinstance(raw, ToolResult):
             return ToolResult(
                 name=call.name,

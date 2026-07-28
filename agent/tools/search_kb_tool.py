@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from agent.observability.logger import get_logger
 from agent.rag.retriever import Retriever
-from agent.tools.registry import Tool, ToolResult
+from agent.tools.registry import Tool, ToolContext, ToolResult
 from ingestion.vector_store import VectorStoreError
 
 log = get_logger(__name__)
@@ -28,9 +28,7 @@ class SearchKbArgs(BaseModel):
         max_length=MAX_QUERY_LENGTH,
         description="What to search the knowledge base for.",
     )
-    top_k: int = Field(
-        default=3, ge=1, le=10, description="How many chunks to return (1-10)."
-    )
+    top_k: int = Field(default=3, ge=1, le=10, description="How many chunks to return (1-10).")
     doc_name: str | None = Field(
         default=None,
         max_length=200,
@@ -46,6 +44,8 @@ class SearchKbTool(Tool):
         "look up a related policy section before answering."
     )
     args_model = SearchKbArgs
+    # Reads tenant data, so it is never called without a workspace scope.
+    requires_workspace = True
 
     def __init__(self, retriever: Retriever | None = None) -> None:
         self._retriever = retriever
@@ -56,13 +56,18 @@ class SearchKbTool(Tool):
             self._retriever = Retriever()
         return self._retriever
 
-    def run(self, **kwargs: Any) -> ToolResult:
+    def run(self, context: ToolContext, **kwargs: Any) -> ToolResult:
         query = kwargs["query"]
         top_k = int(kwargs.get("top_k") or 3)
         doc_name = kwargs.get("doc_name") or None
 
         try:
-            result = self.retriever.retrieve(query, top_k=top_k, doc_name=doc_name)
+            result = self.retriever.retrieve(
+                query,
+                top_k=top_k,
+                doc_name=doc_name,
+                workspace_id=context.workspace_id,
+            )
         except VectorStoreError as exc:
             # Surface a retryable signal to the model rather than crashing.
             log.warning("tool.search_kb_store_error", context={"reason": str(exc)})
