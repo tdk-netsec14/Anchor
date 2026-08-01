@@ -39,9 +39,10 @@ async def health() -> HealthResponse:
     # Both probes block: the store hits disk and the OCR check spawns the
     # tesseract binary. An orchestrator polls this route on a timer, so running
     # them on the event loop would stall every other request each time.
-    vector_store, ocr = await asyncio.gather(
+    vector_store, ocr, database = await asyncio.gather(
         run_in_threadpool(get_vector_store().health),
         run_in_threadpool(ocr_available),
+        run_in_threadpool(_database_health),
     )
 
     return HealthResponse(
@@ -53,10 +54,37 @@ async def health() -> HealthResponse:
         checks={
             "config": "ok",
             "vector_store": vector_store,
+            "database": database,
+            "storage": {"backend": settings.STORAGE_BACKEND, "status": "configured"},
             "ocr": "available" if ocr else "unavailable",
             "queries_served": snapshot["total_queries"],
         },
     )
+
+
+def _database_health() -> dict[str, Any]:
+    """Non-throwing database probe.
+
+    ``not_configured`` is reported rather than treated as a fault: a
+    development deployment with no database is a supported mode, and
+    ``ENVIRONMENT=prod`` cannot start without one.
+    """
+    from agent.db.session import database_configured
+
+    if not database_configured():
+        return {"status": "not_configured"}
+    try:
+        from sqlalchemy import text
+
+        from agent.db.base import get_engine
+
+        with get_engine().connect() as connection:
+            connection.execute(text("SELECT 1"))
+        return {"status": "ok"}
+    except Exception as exc:
+        # The exception type, not its message: a connection error can name the
+        # host and the credentials it failed on.
+        return {"status": "unavailable", "error": type(exc).__name__}
 
 
 @router.get(
