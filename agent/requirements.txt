@@ -6,10 +6,36 @@ fastapi>=0.115,<1.0
 uvicorn[standard]>=0.32,<1.0
 pydantic>=2.9,<3.0
 pydantic-settings>=2.6,<3.0
+# `EmailStr` pulls this in. The auth schemas use it, and the failure it causes
+# is at import time, so without it the service does not start at all.
+email-validator>=2.2
 python-multipart>=0.0.12
 PyJWT>=2.9,<3.0
 httpx>=0.27,<1.0
 numpy>=1.26,<3.0
+
+# Persistence. Anchor is multi-tenant and every session, document, membership
+# and usage row lives in the database, so these are runtime requirements of the
+# API itself — not tooling. SQLAlchemy arrives transitively via chromadb, but
+# it is declared here because the application imports it directly and must not
+# depend on another package's dependency tree to keep working.
+SQLAlchemy>=2.0,<3.0
+# psycopg 3 is the PostgreSQL driver. `binary` avoids needing libpq in the
+# image. SQLite (used by the tests) is built into SQLAlchemy.
+psycopg[binary]>=3.2,<4.0
+
+# Migrations. Anchor never creates its schema at startup, so a deployment
+# applies it with `python -m alembic upgrade head` — which means the image has
+# to be able to run Alembic.
+alembic>=1.13,<2.0
+
+# Authentication. `argon2-cffi` is imported at module load, not lazily, so a
+# missing wheel is a crash on boot rather than a failed login.
+argon2-cffi>=23.1
+
+# Object storage. Imported lazily, but production refuses to start unless
+# STORAGE_BACKEND is "s3", so the image always needs the driver.
+boto3>=1.35,<2.0
 
 # Retrieval stack (shared with the ingestion service).
 chromadb>=0.5.23,<1.0
