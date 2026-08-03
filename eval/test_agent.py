@@ -228,6 +228,49 @@ def test_test_case_file_is_well_formed() -> None:
         assert case["category"] in {"factual", "tool_use", "adversarial", "out_of_scope"}
 
 
+#: Credentials the live cases authenticate with. `/query` is tenant-scoped, so
+#: a demo token from `/auth/token` — which names no workspace — is refused by
+#: the very route these cases exercise. The harness therefore signs in as a
+#: real account, creating it on the first run.
+EVAL_EMAIL = "eval-pytest@example.com"
+EVAL_PASSWORD = "evaluation-harness-passphrase"
+
+
+def _live_token(client) -> str:  # noqa: ANN001 - an httpx.Client
+    """Register (first run) or log in, and return an access token.
+
+    Falls back to the development token endpoint for a deployment with no
+    database, where there are no accounts to register.
+    """
+    root = BASE_URL.rstrip("/")
+    registered = client.post(
+        f"{root}/auth/register",
+        json={
+            "email": EVAL_EMAIL,
+            "password": EVAL_PASSWORD,
+            "full_name": "Evaluation Harness",
+            "workspace_name": "Evaluation",
+        },
+        timeout=30.0,
+    )
+    if registered.status_code == 201:
+        return registered.json()["access_token"]
+
+    logged_in = client.post(
+        f"{root}/auth/login",
+        json={"email": EVAL_EMAIL, "password": EVAL_PASSWORD},
+        timeout=30.0,
+    )
+    if logged_in.status_code == 200:
+        return logged_in.json()["access_token"]
+
+    return client.post(
+        f"{root}/auth/token",
+        json={"username": "eval-pytest", "role": "user"},
+        timeout=30.0,
+    ).json()["access_token"]
+
+
 @requires_api
 @pytest.mark.integration
 @pytest.mark.parametrize("case", _load_cases(), ids=lambda c: c["id"])
@@ -236,11 +279,7 @@ def test_case_against_live_api(case: dict[str, Any]) -> None:
     import httpx
 
     with httpx.Client() as client:
-        token = client.post(
-            f"{BASE_URL.rstrip('/')}/auth/token",
-            json={"username": "eval-pytest", "role": "user"},
-            timeout=30.0,
-        ).json()["access_token"]
+        token = _live_token(client)
 
         response = client.post(
             f"{BASE_URL.rstrip('/')}/query",

@@ -34,6 +34,8 @@ from eval.graders.llm_judge_grader import LlmJudgeGrader  # noqa: E402
 from eval.graders.semantic_similarity_grader import SemanticGrader  # noqa: E402
 
 TEST_CASES_PATH = ROOT / "eval" / "test_cases.json"
+#: The sample corpus the factual and tool-use cases are written against.
+SAMPLE_DOCUMENTS = ROOT / "data" / "documents"
 RESULTS_DIR = ROOT / "eval" / "results"
 
 #: Categories whose cases pass by being *rejected* by the input guard, and
@@ -49,15 +51,85 @@ def load_cases(path: Path = TEST_CASES_PATH) -> list[dict[str, Any]]:
     return cases
 
 
+#: Credentials the harness uses to sign in. A real account is required because
+#: `/query` is tenant-scoped: a demo token from `/auth/token` names no
+#: workspace and is refused by every route the evaluation exercises.
+EVAL_EMAIL = "eval-runner@example.com"
+EVAL_PASSWORD = "evaluation-harness-passphrase"
+
+
 def get_token(client: httpx.Client, base_url: str, role: str = "user") -> str:
-    """Mint a token through the public auth endpoint."""
+    """Sign in as the harness account, creating it on first run.
+
+    Registration and login are both tried because a fresh deployment has no
+    account yet, while a re-run against the same database does. The account is
+    the owner of its own workspace, so it can ingest and read everything the
+    evaluation needs.
+    """
+    root = base_url.rstrip("/")
+
+    registered = client.post(
+        f"{root}/auth/register",
+        json={
+            "email": EVAL_EMAIL,
+            "password": EVAL_PASSWORD,
+            "full_name": "Evaluation Harness",
+            "workspace_name": "Evaluation",
+        },
+        timeout=30.0,
+    )
+    if registered.status_code == 201:
+        return registered.json()["access_token"]
+
     response = client.post(
-        f"{base_url.rstrip('/')}/auth/token",
+        f"{root}/auth/login",
+        json={"email": EVAL_EMAIL, "password": EVAL_PASSWORD},
+        timeout=30.0,
+    )
+    if response.status_code == 200:
+        return response.json()["access_token"]
+
+    # A deployment with no database has no accounts to register. Fall back to
+    # the development token endpoint, which only such a deployment serves.
+    fallback = client.post(
+        f"{root}/auth/token",
         json={"username": "eval-runner", "role": role},
         timeout=30.0,
     )
-    response.raise_for_status()
-    return response.json()["access_token"]
+    fallback.raise_for_status()
+    return fallback.json()["access_token"]
+
+
+def ensure_knowledge_base(client: httpx.Client, base_url: str, token: str) -> int:
+    """Make sure the harness's workspace holds the sample documents.
+
+    Anchor is multi-tenant, so the knowledge base is per-workspace: an account
+    created by this harness starts with an *empty* one. Without this the
+    harness would score every grounded question as a failure and every
+    ungrounded question as a pass — a silent, inverted result that looks like a
+    model regression.
+
+    Returns the number of documents the workspace holds afterwards. Documents
+    are queued rather than indexed inline, so a deployment with a background
+    worker needs a moment before the first case can retrieve anything; the
+    message below says so rather than letting the run quietly under-report.
+    """
+    root = base_url.rstrip("/")
+    listed = client.get(f"{root}/documents", headers={"Authorization": f"Bearer {token}"})
+    if listed.status_code != 200:
+        return 0
+    if listed.json().get("documents"):
+        return len(listed.json()["documents"])
+
+    for path in sorted(SAMPLE_DOCUMENTS.glob("*.pdf")):
+        with path.open("rb") as handle:
+            client.post(
+                f"{root}/ingest",
+                files={"file": (path.name, handle, "application/pdf")},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=300.0,
+            )
+    return len(listed.json().get("documents", [])) or len(list(SAMPLE_DOCUMENTS.glob("*.pdf")))
 
 
 def run_case(
@@ -424,11 +496,25 @@ def main(argv: list[str] | None = None) -> int:
                 token = get_token(client, args.base_url)
             except Exception as exc:
                 print(
-                    f"Could not obtain a token from {args.base_url}/auth/token: {exc}\n"
-                    "Is the Anchor API running? Start it with `docker compose up`.",
+                    f"Could not sign in to {args.base_url}: {exc}\n"
+                    "The harness registers and logs in as "
+                    f"{EVAL_EMAIL}. Is the Anchor API running? Start it with "
+                    "`docker compose up`.",
                     file=sys.stderr,
                 )
                 return 2
+
+            documents = ensure_knowledge_base(client, args.base_url, token)
+            if documents == 0:
+                print(
+                    "Warning: the harness workspace has no documents, so the grounded "
+                    "cases will fail. Load the sample corpus first "
+                    "(docker compose --profile batch run --rm ingestion), or point the "
+                    "run at a workspace that already has one.",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"Knowledge base: {documents} document(s) in the harness workspace.")
 
             for index, case in enumerate(cases, start=1):
                 print(
