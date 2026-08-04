@@ -19,7 +19,7 @@ class EchoTool(Tool):
     description = "Echo text."
     args_model = EchoArgs
 
-    def run(self, **kwargs):
+    def run(self, context, **kwargs):
         return kwargs["text"] * kwargs["times"]
 
 
@@ -27,7 +27,7 @@ class ExplodingTool(Tool):
     name = "boom"
     description = "Always raises."
 
-    def run(self, **kwargs):
+    def run(self, context, **kwargs):
         raise RuntimeError("internal detail: /etc/secret-path")
 
 
@@ -111,7 +111,7 @@ def test_tool_returning_tool_result_preserves_metadata() -> None:
         name = "meta"
         description = "Returns metadata."
 
-        def run(self, **kwargs):
+        def run(self, context, **kwargs):
             return ToolResult(name="meta", ok=True, content="body", metadata={"citations": ["a.pdf"]})
 
     reg = ToolRegistry()

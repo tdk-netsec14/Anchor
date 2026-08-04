@@ -41,6 +41,94 @@ def _reset_singletons():
     registry.reset()
 
 
+# ---------------------------------------------------------------------------
+# Database-backed tests
+# ---------------------------------------------------------------------------
+# Anchor's persistence tests run against SQLite in memory. The models, the
+# session handling and the tenant predicates are the same code PostgreSQL runs;
+# only the driver differs, and the migration round-trip is verified against a
+# real PostgreSQL in CI.
+#
+# The application builds its own engine from DATABASE_URL, exactly as it does
+# in production, and the fixture creates the schema on *that* engine. Nothing
+# is injected or stubbed, so the code under test is the code that ships.
+@pytest.fixture
+def saas_env(monkeypatch):
+    """A TestClient whose application is backed by a fresh in-memory database.
+
+    Yields ``(client, session)``: the client to drive the API, and a session on
+    the same engine to arrange and assert against the rows behind it.
+    """
+    from fastapi.testclient import TestClient
+
+    import agent.db.models  # noqa: F401  (registers the tables on Base.metadata)
+    from agent.config import get_settings
+    from agent.db.base import Base, get_engine, get_session_factory, reset_engine
+    from agent.main import create_app
+
+    monkeypatch.setenv("DATABASE_URL", "sqlite://")
+    get_settings.cache_clear()
+    reset_engine()
+    Base.metadata.create_all(get_engine())
+
+    session = get_session_factory()()
+    try:
+        with TestClient(create_app()) as client:
+            yield client, session
+    finally:
+        session.close()
+        reset_engine()
+
+
+@pytest.fixture
+def app_client(saas_env):
+    return saas_env[0]
+
+
+@pytest.fixture
+def db_session(saas_env):
+    return saas_env[1]
+
+
+@pytest.fixture
+def registered(app_client):
+    """Register an owner through the API and return their session.
+
+    Driving the real endpoint means password hashing, workspace creation and
+    session issuance are covered by every test that uses this, rather than each
+    test building its own shortcut past them.
+    """
+    session = register(app_client, "owner@example.com", workspace_name="Acme")
+    session["headers"] = {"Authorization": f"Bearer {session['access_token']}"}
+    return session
+
+
+def register(client, email: str, *, password: str = "correct-horse-battery-staple", **extra):
+    """Register a user and return the session body, asserting it succeeded."""
+    response = client.post(
+        "/auth/register",
+        json={
+            "email": email,
+            "password": password,
+            "full_name": email.split("@")[0].title(),
+            **extra,
+        },
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    body["headers"] = {"Authorization": f"Bearer {body['access_token']}"}
+    return body
+
+
+def login(client, email: str, password: str = "correct-horse-battery-staple"):
+    """Log in and return the session body, asserting it succeeded."""
+    response = client.post("/auth/login", json={"email": email, "password": password})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    body["headers"] = {"Authorization": f"Bearer {body['access_token']}"}
+    return body
+
+
 @pytest.fixture(scope="session")
 def settings():
     return get_settings()

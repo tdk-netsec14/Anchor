@@ -220,7 +220,7 @@ class _FixedIdTicketTool(Tool):
     reference_pattern = r"TCK-FIXED1234"
     reference_label = "Ticket reference"
 
-    def run(self, **kwargs: Any) -> str:
+    def run(self, context, **kwargs: Any) -> str:
         return "TICKET ID: TCK-FIXED1234\nPriority: high\nStatus: created."
 
 
@@ -287,8 +287,9 @@ async def test_search_kb_tool_adds_its_sources_to_the_response(registry: ToolReg
             text_response("Receipts are required over 25 USD [S1]."),
         ]
     )
+    # search_kb reads tenant data, so it only runs inside a workspace.
     outcome = await build_agent(provider, shared, retriever).answer(
-        "Do I need a receipt for a 30 USD lunch?"
+        "Do I need a receipt for a 30 USD lunch?", workspace_id="ws_test"
     )
 
     assert outcome.tool_calls[0].name == "search_kb"
@@ -301,6 +302,36 @@ async def test_search_kb_tool_adds_its_sources_to_the_response(registry: ToolReg
     expected = [c.citation for c in retriever.chunks]
     assert outcome.sources == expected
     assert len(outcome.sources) == len(set(outcome.sources))
+
+
+@pytest.mark.asyncio
+async def test_search_kb_refuses_to_run_without_a_workspace(registry: ToolRegistry) -> None:
+    """The unscoped call is a recorded tool error, not a cross-tenant read.
+
+    An answer that arrives with no workspace has no tenancy to search within,
+    so the tool refuses. The refusal is reported to the model as a tool error
+    (so it can recover by answering from the context it already has) rather
+    than silently returning unscoped documents.
+    """
+    retriever = FakeRetriever()
+    shared = make_registry(retriever)
+    provider = ScriptedProvider(
+        script=[
+            tool_response("search_kb", {"query": "expense receipts", "top_k": 2}),
+            text_response("I could not search further [S1]."),
+        ]
+    )
+    outcome = await build_agent(provider, shared, retriever).answer(
+        "Do I need a receipt for a 30 USD lunch?"
+    )
+
+    assert outcome.tool_calls[0].name == "search_kb"
+    assert outcome.tool_calls[0].ok is False
+    assert "workspace" in outcome.tool_calls[0].result_preview
+    # The point of the guard: the tool's own query never reached the retriever.
+    # The agent's initial retrieval still runs — that path is scoped separately
+    # by the retriever, which refuses an unscoped search once a database exists.
+    assert "expense receipts" not in retriever.calls
 
 
 @pytest.mark.asyncio

@@ -111,6 +111,9 @@ class FakeRetriever:
     def __init__(self, chunks: list[RetrievedChunk] | None = None) -> None:
         self.chunks = chunks if chunks is not None else default_chunks()
         self.calls: list[str] = []
+        #: Every workspace this retriever was asked to scope to, so a test can
+        #: assert the agent passed one through.
+        self.scopes: list[str | None] = []
 
     def retrieve(
         self,
@@ -119,8 +122,10 @@ class FakeRetriever:
         top_k: int | None = None,
         min_score: float = 0.0,
         doc_name: str | None = None,
+        workspace_id: str | None = None,
     ) -> RetrievalResult:
         self.calls.append(query)
+        self.scopes.append(workspace_id)
         selected = self.chunks[: (top_k or 4)]
         if doc_name:
             selected = [c for c in selected if c.doc_name == doc_name]

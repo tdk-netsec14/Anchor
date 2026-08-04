@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from agent.tools.calculator_tool import CalculatorTool, safe_calculate
-from agent.tools.registry import ToolError
+from agent.tools.registry import UNSCOPED, ToolError
 
 pytestmark = pytest.mark.security
 
@@ -98,7 +98,8 @@ def test_oversized_expression_is_rejected() -> None:
 
 
 def test_tool_returns_a_readable_result() -> None:
-    result = CalculatorTool().run(expression="2 * 21")
+    # Called directly, outside a request, so there is no workspace scope.
+    result = CalculatorTool().run(UNSCOPED, expression="2 * 21")
     assert result.startswith("42")
 
 
