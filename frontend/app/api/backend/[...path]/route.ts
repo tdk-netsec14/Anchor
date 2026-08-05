@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
-import { BackendError, callBackend } from "@/lib/backend";
-import { clearSessionCookie, getToken } from "@/lib/session";
+import { BackendError, backendUrl, callBackend } from "@/lib/backend";
+import { clearSession, getToken } from "@/lib/session";
 import { ApiErrorBody } from "@/types/api";
 
 /**
@@ -123,14 +123,57 @@ async function proxy(request: Request, { params }: Params, method: string) {
       headers: result.requestId ? { "X-Request-ID": result.requestId } : undefined,
     });
   } catch (err) {
-    if (err instanceof BackendError) {
-      // An expired or rejected token should not leave a dead cookie behind —
-      // clearing it lets the client fall straight through to the login screen.
-      if (err.status === 401) {
-        await clearSessionCookie();
+    if (!(err instanceof BackendError)) throw err;
+
+    // An expired access token is the ordinary case for a tab left open, not a
+    // reason to sign the person out. Redeem the refresh token once and replay
+    // the request, rather than making every interaction fail until they log in
+    // again. A 401 the refresh cannot fix is a real rejection, and only then is
+    // the dead cookie cleared.
+    if (err.status === 401 && (await refreshSession())) {
+      try {
+        const retried = await callBackend({
+          path: target,
+          method,
+          token: (await getToken()) ?? undefined,
+          body,
+          contentType,
+          timeoutMs: target.startsWith("/ingest") ? INGEST_TIMEOUT_MS : DEFAULT_TIMEOUT_MS,
+        });
+        return NextResponse.json(retried.body, {
+          status: retried.status,
+          headers: retried.requestId ? { "X-Request-ID": retried.requestId } : undefined,
+        });
+      } catch (retryErr) {
+        if (!(retryErr instanceof BackendError)) throw retryErr;
+        return NextResponse.json(retryErr.toApiError(), { status: retryErr.status });
       }
-      return NextResponse.json(err.toApiError(), { status: err.status });
     }
-    throw err;
+
+    if (err.status === 401) {
+      // Clearing it lets the client fall straight through to the login screen.
+      await clearSession();
+    }
+    return NextResponse.json(err.toApiError(), { status: err.status });
+  }
+}
+
+/**
+ * Redeem the refresh token for a new access token.
+ *
+ * The call is made by hand rather than through `callBackend` because the
+ * failure has to stay silent: a refresh that does not work is not an error the
+ * person browsing the app did anything about, and surfacing it as one would
+ * turn a routine token expiry into a red banner.
+ */
+async function refreshSession(): Promise<boolean> {
+  try {
+    const response = await fetch(`${backendUrl()}/api/auth/refresh`, {
+      method: "POST",
+      cache: "no-store",
+    });
+    return response.ok;
+  } catch {
+    return false;
   }
 }

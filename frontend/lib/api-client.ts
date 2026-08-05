@@ -1,15 +1,25 @@
 import {
   ActivityResponse,
+  AnalyticsOverview,
   ApiError,
+  ApiKeyCreatedResponse,
+  ApiKeyResponse,
+  AuditResponse,
+  ConversationDetail,
+  ConversationSummary,
   DocumentsResponse,
   HealthResponse,
   IngestResponse,
+  InviteResponse,
+  MemberResponse,
   MetricsResponse,
   QueryRequest,
   QueryResponse,
-  Role,
   Session,
   SettingsResponse,
+  TimeseriesResponse,
+  WorkspaceRole,
+  WorkspaceSummary,
 } from "@/types/api";
 
 /**
@@ -88,15 +98,27 @@ async function request<T>(
 export const api = {
   /* -- session ---------------------------------------------------------- */
 
-  async login(username: string, role: Role): Promise<Session> {
+  login(email: string, password: string): Promise<Session> {
     return request<Session>("/api/auth/login", {
       method: "POST",
-      body: JSON.stringify({ username, role }),
+      body: JSON.stringify({ email, password }),
+    });
+  },
+
+  register(input: {
+    email: string;
+    password: string;
+    full_name?: string;
+    workspace_name?: string;
+  }): Promise<Session> {
+    return request<Session>("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify(input),
     });
   },
 
   async logout(): Promise<void> {
-    await request<{ status: string }>("/api/auth/logout", { method: "POST" });
+    await request<{ status: string }>("/api/auth/logout", { method: "POST" }, false);
   },
 
   /** Current principal, or null when signed out. Does not raise on 401. */
@@ -119,13 +141,22 @@ export const api = {
     });
   },
 
+  /* -- documents -------------------------------------------------------- */
+
   documents(): Promise<DocumentsResponse> {
     return request<DocumentsResponse>("/api/backend/documents");
   },
 
-  deleteDocument(docName: string): Promise<{ status: string; doc_name: string }> {
-    return request(`/api/backend/documents/${encodeURIComponent(docName)}`, {
+  deleteDocument(documentId: string): Promise<{ status: string }> {
+    return request(`/api/backend/documents/${encodeURIComponent(documentId)}`, {
       method: "DELETE",
+    });
+  },
+
+  reindexDocument(documentId: string): Promise<{ status: string }> {
+    return request(`/api/backend/documents/${encodeURIComponent(documentId)}/reindex`, {
+      method: "POST",
+      body: "{}",
     });
   },
 
@@ -136,12 +167,115 @@ export const api = {
     return request<IngestResponse>("/api/backend/ingest", { method: "POST", body: form });
   },
 
+  /* -- conversations ---------------------------------------------------- */
+
+  conversations(): Promise<ConversationSummary[]> {
+    return request<ConversationSummary[]>("/api/backend/conversations");
+  },
+
+  conversation(id: string): Promise<ConversationDetail> {
+    return request<ConversationDetail>(`/api/backend/conversations/${encodeURIComponent(id)}`);
+  },
+
+  createConversation(title?: string): Promise<ConversationSummary> {
+    return request<ConversationSummary>("/api/backend/conversations", {
+      method: "POST",
+      body: JSON.stringify(title ? { title } : {}),
+    });
+  },
+
+  renameConversation(id: string, title: string): Promise<ConversationSummary> {
+    return request<ConversationSummary>(`/api/backend/conversations/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title }),
+    });
+  },
+
+  deleteConversation(id: string): Promise<{ status: string }> {
+    return request(`/api/backend/conversations/${encodeURIComponent(id)}`, { method: "DELETE" });
+  },
+
+  /* -- team ------------------------------------------------------------- */
+
+  members(): Promise<MemberResponse[]> {
+    return request<MemberResponse[]>("/api/backend/workspaces/members");
+  },
+
+  invites(): Promise<InviteResponse[]> {
+    return request<InviteResponse[]>("/api/backend/workspaces/invites");
+  },
+
+  inviteMember(email: string, role: WorkspaceRole): Promise<InviteResponse> {
+    return request<InviteResponse>("/api/backend/workspaces/invites", {
+      method: "POST",
+      body: JSON.stringify({ email, role }),
+    });
+  },
+
+  revokeInvite(id: string): Promise<{ status: string }> {
+    return request(`/api/backend/workspaces/invites/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+  },
+
+  setMemberRole(userId: string, role: WorkspaceRole): Promise<MemberResponse> {
+    return request<MemberResponse>(
+      `/api/backend/workspaces/members/${encodeURIComponent(userId)}`,
+      { method: "PATCH", body: JSON.stringify({ role }) },
+    );
+  },
+
+  removeMember(userId: string): Promise<{ status: string }> {
+    return request(`/api/backend/workspaces/members/${encodeURIComponent(userId)}`, {
+      method: "DELETE",
+    });
+  },
+
+  workspaces(): Promise<WorkspaceSummary[]> {
+    return request<WorkspaceSummary[]>("/api/auth/workspaces");
+  },
+
+  /* -- api keys --------------------------------------------------------- */
+
+  apiKeys(): Promise<ApiKeyResponse[]> {
+    return request<ApiKeyResponse[]>("/api/backend/api-keys");
+  },
+
+  createApiKey(name: string, expiresInDays?: number): Promise<ApiKeyCreatedResponse> {
+    return request<ApiKeyCreatedResponse>("/api/backend/api-keys", {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        ...(expiresInDays ? { expires_in_days: expiresInDays } : {}),
+      }),
+    });
+  },
+
+  revokeApiKey(id: string): Promise<{ status: string }> {
+    return request(`/api/backend/api-keys/${encodeURIComponent(id)}`, { method: "DELETE" });
+  },
+
+  /* -- observability ---------------------------------------------------- */
+
   activity(): Promise<ActivityResponse> {
     return request<ActivityResponse>("/api/backend/activity");
   },
 
   metrics(): Promise<MetricsResponse> {
     return request<MetricsResponse>("/api/backend/metrics");
+  },
+
+  /** Workspace usage, from recorded rows. Durable across restarts. */
+  analyticsOverview(days = 30): Promise<AnalyticsOverview> {
+    return request<AnalyticsOverview>(`/api/backend/analytics/overview?days=${days}`);
+  },
+
+  analyticsTimeseries(days = 30): Promise<TimeseriesResponse> {
+    return request<TimeseriesResponse>(`/api/backend/analytics/timeseries?days=${days}`);
+  },
+
+  auditLog(days = 30): Promise<AuditResponse> {
+    return request<AuditResponse>(`/api/backend/analytics/audit?days=${days}`);
   },
 
   settings(): Promise<SettingsResponse> {

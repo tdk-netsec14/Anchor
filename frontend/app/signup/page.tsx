@@ -1,6 +1,5 @@
 "use client";
 
-import { GithubIcon } from "@/components/ui/GithubIcon";
 import { ArrowRight } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -13,11 +12,20 @@ import { Spinner } from "@/components/ui/feedback";
 import { useAuth } from "@/hooks/useAuth";
 import { toApiError } from "@/lib/api-client";
 
-export default function LoginPage() {
-  const { session, initialising, signingIn, signIn } = useAuth();
+/**
+ * Create an account and its first workspace.
+ *
+ * The backend may have registration closed (`AUTH_ALLOW_REGISTRATION=false`),
+ * which it reports as an error on submit. The form stays visible rather than
+ * hiding itself behind a build-time flag the frontend has no way to read.
+ */
+export default function SignupPage() {
+  const { session, initialising, signingIn, signUp } = useAuth();
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [fullName, setFullName] = useState("");
+  const [workspaceName, setWorkspaceName] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -28,7 +36,12 @@ export default function LoginPage() {
     event.preventDefault();
     setError(null);
     try {
-      await signIn(email.trim(), password);
+      await signUp({
+        email: email.trim(),
+        password,
+        full_name: fullName.trim(),
+        workspace_name: workspaceName.trim() || undefined,
+      });
     } catch (err) {
       setError(toApiError(err).message);
     }
@@ -41,22 +54,17 @@ export default function LoginPage() {
           <Mark />
           <span className="text-[15px] font-semibold tracking-tight">Anchor</span>
         </Link>
-        <a
-          href="https://github.com/tdk-netsec14/Anchor"
-          target="_blank"
-          rel="noreferrer"
-          className="inline-flex items-center gap-1.5 text-[13px] text-fg-muted transition-colors hover:text-fg"
-        >
-          <GithubIcon className="size-4" />
-          GitHub
-        </a>
+        <Link href="/login" className="text-[13px] text-fg-muted transition-colors hover:text-fg">
+          Sign in
+        </Link>
       </header>
 
       <main className="flex flex-1 items-center justify-center px-6 py-10 sm:px-10">
         <div className="w-full max-w-sm">
-          <h1 className="text-[22px] font-semibold tracking-tight">Sign in to Anchor</h1>
+          <h1 className="text-[22px] font-semibold tracking-tight">Create your workspace</h1>
           <p className="mt-1.5 text-[13.5px] leading-relaxed text-fg-muted">
-            Your role inside the workspace decides what Anchor will let you do.
+            Documents, conversations and API keys are all scoped to a workspace. You will
+            be its owner.
           </p>
 
           <form onSubmit={submit} className="mt-7 space-y-4">
@@ -84,8 +92,34 @@ export default function LoginPage() {
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                autoComplete="current-password"
+                autoComplete="new-password"
                 required
+                minLength={12}
+              />
+              <p className="text-[11.5px] text-fg-subtle">At least 12 characters.</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label htmlFor="full_name" className="text-[13px] font-medium">
+                Name <span className="font-normal text-fg-subtle">(optional)</span>
+              </label>
+              <Input
+                id="full_name"
+                value={fullName}
+                onChange={(e) => setFullName(e.target.value)}
+                autoComplete="name"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label htmlFor="workspace_name" className="text-[13px] font-medium">
+                Workspace name <span className="font-normal text-fg-subtle">(optional)</span>
+              </label>
+              <Input
+                id="workspace_name"
+                value={workspaceName}
+                onChange={(e) => setWorkspaceName(e.target.value)}
+                placeholder="Acme Support"
               />
             </div>
 
@@ -100,17 +134,10 @@ export default function LoginPage() {
 
             <Button type="submit" variant="primary" size="lg" className="w-full" disabled={signingIn}>
               {signingIn ? <Spinner /> : null}
-              {signingIn ? "Signing in…" : "Sign in"}
+              {signingIn ? "Creating…" : "Create account"}
               {!signingIn ? <ArrowRight className="size-4" /> : null}
             </Button>
           </form>
-
-          <p className="mt-6 text-[12.5px] text-fg-muted">
-            No account yet?{" "}
-            <Link href="/signup" className="font-medium text-accent hover:underline">
-              Create a workspace
-            </Link>
-          </p>
         </div>
       </main>
     </div>

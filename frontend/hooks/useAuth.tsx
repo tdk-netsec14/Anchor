@@ -12,14 +12,20 @@ import {
 } from "react";
 
 import { SESSION_EXPIRED, api } from "@/lib/api-client";
-import { Role, Session } from "@/types/api";
+import { Session } from "@/types/api";
 
 type AuthValue = {
   session: Session | null;
   /** True until the initial session probe resolves; gates the shell. */
   initialising: boolean;
   signingIn: boolean;
-  signIn: (username: string, role: Role) => Promise<void>;
+  signIn: (email: string, password: string) => Promise<void>;
+  signUp: (input: {
+    email: string;
+    password: string;
+    full_name?: string;
+    workspace_name?: string;
+  }) => Promise<void>;
   signOut: () => Promise<void>;
 };
 
@@ -60,11 +66,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener(SESSION_EXPIRED, onExpired);
   }, [router]);
 
-  const signIn = useCallback(async (username: string, role: Role) => {
+  const signIn = useCallback(async (email: string, password: string) => {
     setSigningIn(true);
     try {
-      setSession(await api.login(username, role));
-      router.push("/assistant");
+      setSession(await api.login(email, password));
+      router.push("/dashboard");
+    } finally {
+      setSigningIn(false);
+    }
+  }, [router]);
+
+  const signUp = useCallback<AuthValue["signUp"]>(async (input) => {
+    setSigningIn(true);
+    try {
+      setSession(await api.register(input));
+      router.push("/dashboard");
     } finally {
       setSigningIn(false);
     }
@@ -80,8 +96,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [router]);
 
   const value = useMemo(
-    () => ({ session, initialising, signingIn, signIn, signOut }),
-    [session, initialising, signingIn, signIn, signOut],
+    () => ({ session, initialising, signingIn, signIn, signUp, signOut }),
+    [session, initialising, signingIn, signIn, signUp, signOut],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

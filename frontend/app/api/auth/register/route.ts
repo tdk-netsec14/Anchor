@@ -2,17 +2,17 @@ import { NextResponse } from "next/server";
 
 import { BackendError, callBackend } from "@/lib/backend";
 import { setSession } from "@/lib/session";
-import { ApiErrorBody, SessionResponse } from "@/types/api";
+import { SessionResponse } from "@/types/api";
 
 /**
- * Exchange an email and password for an Anchor session.
+ * Create an account and its first workspace.
  *
- * The tokens come back from FastAPI and go straight into httpOnly cookies;
- * only the descriptive half of the session is returned to the browser, so the
- * access and refresh tokens never enter the client bundle.
+ * Registration is refused by the backend when `AUTH_ALLOW_REGISTRATION` is
+ * off, which is how an invite-only deployment closes this path without the
+ * frontend needing to know the difference.
  */
 export async function POST(request: Request) {
-  let payload: { email?: string; password?: string };
+  let payload: { email?: string; password?: string; full_name?: string; workspace_name?: string };
   try {
     payload = await request.json();
   } catch {
@@ -21,27 +21,32 @@ export async function POST(request: Request) {
 
   const email = (payload.email ?? "").trim();
   const password = payload.password ?? "";
+  const fullName = (payload.full_name ?? "").trim();
 
   if (!email || !password) {
     return json(
-      {
-        error: "invalid_request",
-        message: "Enter both your email address and your password.",
-      } satisfies ApiErrorBody,
+      { error: "invalid_request", message: "An email address and password are required." },
       400,
     );
   }
 
+  const workspaceName = (payload.workspace_name ?? "").trim();
+
   try {
     const { body } = await callBackend({
-      path: "/auth/login",
+      path: "/auth/register",
       method: "POST",
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({
+        email,
+        password,
+        full_name: fullName,
+        ...(workspaceName ? { workspace_name: workspaceName } : {}),
+      }),
       contentType: "application/json",
     });
 
     const session = await setSession(body as SessionResponse);
-    return json(session);
+    return json(session, 201);
   } catch (err) {
     if (err instanceof BackendError) {
       return json(err.toApiError(), err.status);
