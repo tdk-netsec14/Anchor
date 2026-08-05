@@ -7,9 +7,13 @@ import {
   BarChart3,
   BookOpen,
   Bot,
+  Files,
+  LayoutDashboard,
   LogOut,
+  MessageSquare,
   Settings as SettingsIcon,
   Shield,
+  Users,
   X,
 } from "lucide-react";
 import Link from "next/link";
@@ -19,10 +23,14 @@ import { useAuth } from "@/hooks/useAuth";
 import { cn } from "@/lib/format";
 
 const WORKSPACE = [
+  { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { href: "/assistant", label: "Assistant", icon: Bot },
+  { href: "/conversations", label: "Conversations", icon: MessageSquare },
   { href: "/knowledge", label: "Knowledge Base", icon: BookOpen },
+  { href: "/documents", label: "Documents", icon: Files },
   { href: "/activity", label: "Activity", icon: ActivityIcon },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
+  { href: "/team", label: "Team", icon: Users },
   { href: "/settings", label: "Settings", icon: SettingsIcon },
 ];
 
@@ -39,7 +47,7 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   return (
     <div className="flex h-full flex-col border-r border-border bg-surface">
       <div className="flex h-14 items-center justify-between px-4">
-        <Link href="/assistant" className="flex items-center gap-2.5" onClick={onNavigate}>
+        <Link href="/dashboard" className="flex items-center gap-2.5" onClick={onNavigate}>
           <Mark />
           <span className="text-[15px] font-semibold tracking-tight">Anchor</span>
         </Link>
@@ -108,12 +116,14 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
 
         <div className="flex items-center gap-2.5 rounded-lg bg-surface-2 px-2.5 py-2">
           <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-accent text-[11px] font-semibold text-accent-fg">
-            {(session?.user_id ?? "?").slice(0, 1).toUpperCase()}
+            {(session?.full_name || session?.email || "?").slice(0, 1).toUpperCase()}
           </span>
           <span className="min-w-0 flex-1">
-            <span className="block truncate text-[13px] font-medium">{session?.user_id}</span>
-            <span className="block font-mono text-[10px] uppercase tracking-wide text-fg-subtle">
-              {session?.role}
+            <span className="block truncate text-[13px] font-medium">
+              {session?.full_name || session?.email}
+            </span>
+            <span className="block truncate font-mono text-[10px] uppercase tracking-wide text-fg-subtle">
+              {session?.workspace_role}
             </span>
           </span>
           <button

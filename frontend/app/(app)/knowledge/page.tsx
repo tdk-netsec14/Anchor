@@ -13,14 +13,15 @@ import { useAuth } from "@/hooks/useAuth";
 import { useAsync } from "@/hooks/useAsync";
 import { api, toApiError } from "@/lib/api-client";
 import { formatNumber } from "@/lib/format";
-import { ApiError } from "@/types/api";
+import { hasWorkspaceRole } from "@/types/api";
+import { ApiError, DocumentItem } from "@/types/api";
 
 export default function KnowledgePage() {
   const { session } = useAuth();
-  const isAdmin = session?.role === "admin";
+  const isAdmin = hasWorkspaceRole(session?.workspace_role, "admin");
   const [uploading, setUploading] = useState(false);
+  const [pending, setPending] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ tone: "success" | "error"; text: string } | null>(null);
-  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
 
   const docs = useAsync(useCallback(() => api.documents(), []));
   const config = useAsync(useCallback(() => api.settings(), []));
@@ -32,12 +33,20 @@ export default function KnowledgePage() {
     setNotice(null);
     try {
       const result = await api.uploadDocument(file, file.name);
-      setNotice({
-        tone: "success",
-        text: `Indexed ${result.doc_name} — ${formatNumber(result.chunks_created)} chunks from ${
-          result.pages_processed
-        } page(s)${result.pages_using_ocr ? `, ${result.pages_using_ocr} via OCR` : ""}.`,
-      });
+      // With a database configured the response returns as soon as the bytes
+      // are stored; a worker does the rest. Saying "indexed" here would be a
+      // claim the backend has not made yet.
+      setNotice(
+        result.status === "queued"
+          ? {
+              tone: "success",
+              text: `${result.doc_name} uploaded and queued. It appears as indexed once a worker has embedded it.`,
+            }
+          : {
+              tone: "success",
+              text: `Indexed ${result.doc_name} — ${formatNumber(result.chunks_created)} chunks from ${result.pages_processed} page(s)${result.pages_using_ocr ? `, ${result.pages_using_ocr} via OCR` : ""}.`,
+            },
+      );
       docs.reload();
     } catch (err) {
       const error: ApiError = toApiError(err);
@@ -47,17 +56,33 @@ export default function KnowledgePage() {
     }
   }
 
-  async function remove(docName: string) {
-    setPendingDelete(docName);
+  async function remove(doc: DocumentItem) {
+    const key = doc.id ?? doc.doc_name;
+    setPending(key);
     setNotice(null);
     try {
-      await api.deleteDocument(docName);
-      setNotice({ tone: "success", text: `Removed ${docName} and its chunks.` });
+      await api.deleteDocument(key);
+      setNotice({ tone: "success", text: `Removed ${doc.doc_name} and its chunks.` });
       docs.reload();
     } catch (err) {
       setNotice({ tone: "error", text: toApiError(err).message });
     } finally {
-      setPendingDelete(null);
+      setPending(null);
+    }
+  }
+
+  async function reindex(doc: DocumentItem) {
+    if (!doc.id) return;
+    setPending(doc.id);
+    setNotice(null);
+    try {
+      await api.reindexDocument(doc.id);
+      setNotice({ tone: "success", text: `Re-queued ${doc.doc_name} for indexing.` });
+      docs.reload();
+    } catch (err) {
+      setNotice({ tone: "error", text: toApiError(err).message });
+    } finally {
+      setPending(null);
     }
   }
 
@@ -100,11 +125,11 @@ export default function KnowledgePage() {
         <Card className="mt-6">
           <CardBody>
             <p className="py-1 text-[13px] leading-relaxed text-fg-muted">
-              Ingesting documents requires the <span className="font-medium text-fg">admin</span>{" "}
-              role. You are signed in as{" "}
-              <span className="font-medium text-fg">{session?.role}</span>, so you can read
-              this knowledge base but not add to it. The backend enforces this on every
-              request, not just in this interface.
+              Ingesting documents requires the{" "}
+              <span className="font-medium text-fg">admin</span> role or higher. You are{" "}
+              <span className="font-medium text-fg">{session?.workspace_role ?? "a viewer"}</span>
+              , so you can read this knowledge base but not add to it. The backend enforces
+              this on every request, not just in this interface.
             </p>
           </CardBody>
         </Card>
@@ -145,8 +170,9 @@ export default function KnowledgePage() {
           <DocumentTable
             documents={docs.data.documents}
             isAdmin={isAdmin}
-            pendingDelete={pendingDelete}
+            pending={pending}
             onDelete={remove}
+            onReindex={reindex}
           />
         ) : (
           <EmptyState

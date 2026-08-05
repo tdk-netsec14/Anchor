@@ -7,23 +7,92 @@
  * degrade honestly instead of rendering a confident blank.
  */
 
+/** The legacy `role` claim every JWT carries. Not an authority on its own. */
 export type Role = "user" | "admin";
+
+/**
+ * What a member may do inside one workspace, ordered most to least capable.
+ * Mirrors `WorkspaceRole` in `agent/db/models.py`; the backend compares ranks,
+ * so the UI only needs the order for enable/disable decisions.
+ */
+export const WORKSPACE_ROLES = ["owner", "admin", "member", "viewer"] as const;
+export type WorkspaceRole = (typeof WORKSPACE_ROLES)[number];
+
+const ROLE_RANK: Record<WorkspaceRole, number> = {
+  owner: 40,
+  admin: 30,
+  member: 20,
+  viewer: 10,
+};
+
+/** True when `role` is at least as capable as `minimum`. */
+export function hasWorkspaceRole(
+  role: WorkspaceRole | null | undefined,
+  minimum: WorkspaceRole,
+): boolean {
+  if (!role) return false;
+  return (ROLE_RANK[role] ?? 0) >= ROLE_RANK[minimum];
+}
 
 /* -- auth ---------------------------------------------------------------- */
 
-export interface TokenResponse {
+/**
+ * `POST /auth/login` and `/auth/register` — the real session.
+ *
+ * `access_token` and `refresh_token` never reach the browser: they are set as
+ * httpOnly cookies by the Next.js route handler. Only the descriptive fields
+ * below are used by the UI.
+ */
+export interface SessionResponse {
   access_token: string;
+  refresh_token: string;
   token_type: "bearer";
+  /** Access-token lifetime in seconds. */
   expires_in: number;
-  role: Role;
+  user_id: string;
+  email: string;
+  full_name: string;
+  workspace_id: string;
+  workspace_name: string;
+  workspace_role: WorkspaceRole;
 }
 
-/** Principal as stored in the session cookie and read back by the UI. */
+/**
+ * The principal as the client sees it.
+ *
+ * Held in a cookie of its own so the shell can render a name, a workspace and a
+ * role without waiting on a round trip. It is a display cache, not a
+ * credential: the token is verified by FastAPI on every request, and nothing
+ * is authorised from this object alone.
+ */
 export interface Session {
   user_id: string;
-  role: Role;
+  email: string;
+  full_name: string;
+  workspace_id: string;
+  workspace_name: string;
+  workspace_role: WorkspaceRole;
+  /** Epoch milliseconds at which the access token stops being accepted. */
   expires_at: number;
 }
+
+export interface UserResponse {
+  user_id: string;
+  email: string;
+  full_name: string;
+  created_at: string;
+  last_login_at: string | null;
+}
+
+export interface WorkspaceSummary {
+  id: string;
+  name: string;
+  slug: string;
+  role: WorkspaceRole;
+  is_personal: boolean;
+  created_at: string;
+}
+
 
 /* -- query --------------------------------------------------------------- */
 
@@ -81,13 +150,35 @@ export interface IngestResponse {
   total_tokens: number;
   replaced_existing: boolean;
   warnings: string[];
+  document_id?: string | null;
+  document_status?: string;
 }
 
+/* -- documents ----------------------------------------------------------- */
+
+export type DocumentStatus = "queued" | "processing" | "indexed" | "failed";
+
+/**
+ * One knowledge-base document.
+ *
+ * `status` is the ingest pipeline's own state, not a boolean: with a database
+ * configured an upload returns as soon as the bytes are stored and a worker
+ * moves the document through queued → processing → indexed (or failed) after
+ * the response has already been sent. The UI has to show that honestly rather
+ * than implying a finished index.
+ */
 export interface DocumentItem {
+  id: string | null;
   doc_name: string;
+  status: DocumentStatus | string;
+  size_bytes: number;
   chunks: number;
   page_count: number;
   ocr_used: boolean;
+  error_message: string | null;
+  uploaded_by: string | null;
+  created_at: string | null;
+  indexed_at: string | null;
 }
 
 export interface DocumentsResponse {
@@ -95,7 +186,129 @@ export interface DocumentsResponse {
   total_chunks: number;
 }
 
+/* -- conversations ------------------------------------------------------- */
+
+export interface ConversationSummary {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+}
+
+export interface MessageRecord {
+  id: string;
+  role: string;
+  content: string;
+  created_at: string;
+  model_used: string | null;
+  provider: string | null;
+  latency_ms: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_usd: number;
+  request_id: string | null;
+  sources: SourceDetail[];
+  tool_calls: ToolCallRecord[];
+  guardrail_flags: string[];
+}
+
+export interface ConversationDetail extends ConversationSummary {
+  messages: MessageRecord[];
+}
+
+/* -- team ---------------------------------------------------------------- */
+
+export interface MemberResponse {
+  user_id: string;
+  email: string;
+  full_name: string;
+  role: WorkspaceRole;
+  is_active: boolean;
+  joined_at: string;
+  last_login_at: string | null;
+}
+
+export interface InviteResponse {
+  id: string;
+  email: string;
+  role: WorkspaceRole;
+  expires_at: string;
+  /** The one and only time the full invite link is shown. */
+  token: string;
+}
+
+/* -- api keys ------------------------------------------------------------ */
+
+export interface ApiKeyResponse {
+  id: string;
+  name: string;
+  key_prefix: string;
+  scopes: string[];
+  created_at: string;
+  expires_at: string | null;
+  revoked_at: string | null;
+  last_used_at: string | null;
+  created_by: string | null;
+}
+
+/** Returned once, at creation. The secret is never retrievable afterwards. */
+export interface ApiKeyCreatedResponse extends ApiKeyResponse {
+  key: string;
+}
+
 /* -- observability ------------------------------------------------------- */
+
+/**
+ * `GET /analytics/overview` — usage for the active workspace, computed from
+ * rows the backend recorded. Every field is a real count; a deployment with no
+ * recorded usage reports zeroes rather than a plausible-looking placeholder.
+ */
+export interface AnalyticsOverview {
+  window_days: number;
+  generated_at: string;
+  requests: { total: number; errors: number; fallbacks: number; success_rate: number };
+  latency_ms: { average: number; max: number };
+  tokens: { prompt: number; completion: number; total: number };
+  cost: { total_usd: number; average_usd_per_request: number };
+  retrieval: { citations_returned: number };
+  by_model: Record<string, number>;
+  by_provider: Record<string, number>;
+  by_user: Record<string, number>;
+  tool_calls: { total: number; by_name: Record<string, number> };
+  guardrail_flags: Record<string, number>;
+  documents: { total: number; by_status: Record<string, number>; chunks: number; failed: number };
+}
+
+export interface TimeseriesPoint {
+  date: string;
+  requests: number;
+  errors: number;
+  tokens: number;
+  cost_usd: number;
+}
+
+export interface TimeseriesResponse {
+  window_days: number;
+  points: TimeseriesPoint[];
+}
+
+/** One row of the security-relevant audit trail. */
+export interface AuditEvent {
+  id: string;
+  created_at: string;
+  action: string;
+  actor_email: string;
+  target_type: string | null;
+  target_id: string | null;
+  outcome: string;
+  request_id: string | null;
+  ip_address: string | null;
+}
+
+export interface AuditResponse {
+  events: AuditEvent[];
+}
 
 export interface ActivityItem {
   id: string;

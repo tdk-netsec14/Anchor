@@ -76,6 +76,12 @@ export function Nav() {
             <GithubIcon className="size-4" />
           </a>
           <ThemeToggle />
+          <Link
+            href="/signup"
+            className={buttonClass("secondary", "sm", "hidden sm:inline-flex")}
+          >
+            Sign up
+          </Link>
           <Link href="/login" className={buttonClass("primary", "sm", "hidden sm:inline-flex")}>
             Open Anchor
           </Link>
@@ -105,6 +111,9 @@ export function Nav() {
               </a>
             ))}
             <div className="flex items-center gap-2 border-t border-border py-3">
+              <Link href="/signup" className={buttonClass("secondary", "sm", "flex-1")}>
+                Sign up
+              </Link>
               <Link href="/login" className={buttonClass("primary", "sm", "flex-1")}>
                 Open Anchor
               </Link>

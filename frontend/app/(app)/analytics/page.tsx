@@ -15,6 +15,7 @@ import { formatCost, formatDuration, formatLatency, formatNumber } from "@/lib/f
 
 export default function AnalyticsPage() {
   const metrics = useAsync(useCallback(() => api.metrics(), []));
+  const overview = useAsync(useCallback(() => api.analyticsOverview(30), []));
 
   return (
     <PageBody>
@@ -27,6 +28,88 @@ export default function AnalyticsPage() {
           </Button>
         }
       />
+
+      {/* Two different questions, deliberately kept apart. The block below is
+          this workspace's durable, per-tenant usage, read from recorded rows;
+          the tiles after it are the running process's live counters, which
+          reset on every deploy. Mixing them would let a restart look like a
+          drop in usage. */}
+      <Card className="mt-6">
+        <CardHeader className="flex flex-row items-center justify-between">
+          <CardTitle>This workspace — last 30 days</CardTitle>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={overview.reload}
+            disabled={overview.loading}
+          >
+            Refresh
+          </Button>
+        </CardHeader>
+        <CardBody>
+          {overview.loading ? (
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <StatTileSkeleton key={i} />
+              ))}
+            </div>
+          ) : overview.error ? (
+            <ErrorNotice error={overview.error} onRetry={overview.reload} />
+          ) : overview.data ? (
+            <>
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <StatTile
+                  label="Answered"
+                  value={formatNumber(overview.data.requests.total)}
+                  hint={`${Math.round(overview.data.requests.success_rate * 100)}% succeeded · ${formatNumber(
+                    overview.data.requests.errors,
+                  )} errored`}
+                  icon={<BarChart3 className="size-3.5" />}
+                />
+                <StatTile
+                  label="Citations"
+                  value={formatNumber(overview.data.retrieval.citations_returned)}
+                  hint="sources returned to the user"
+                  icon={<Layers className="size-3.5" />}
+                />
+                <StatTile
+                  label="Documents"
+                  value={formatNumber(overview.data.documents.total)}
+                  hint={
+                    overview.data.documents.failed
+                      ? `${overview.data.documents.failed} failed · ${formatNumber(
+                          overview.data.documents.chunks,
+                        )} chunks`
+                      : `${formatNumber(overview.data.documents.chunks)} indexed chunks`
+                  }
+                  icon={<Layers className="size-3.5" />}
+                />
+                <StatTile
+                  label="Spend"
+                  value={formatCost(overview.data.cost.total_usd)}
+                  hint={`${formatNumber(overview.data.tokens.total)} tokens`}
+                  icon={<Coins className="size-3.5" />}
+                  accent={overview.data.cost.total_usd > 0}
+                />
+              </div>
+              <p className="mt-3 text-[11.5px] leading-relaxed text-fg-subtle">
+                Cost is zero until <code className="font-mono">COST_INPUT_PER_MTOK</code>{" "}
+                and <code className="font-mono">COST_OUTPUT_PER_MTOK</code> are configured
+                for the models in use. Anchor hardcodes no prices and reports 0.0 rather
+                than guessing.
+              </p>
+            </>
+          ) : null}
+        </CardBody>
+      </Card>
+
+      <div className="mt-8 flex items-baseline gap-3">
+        <h2 className="text-sm font-semibold tracking-tight">This process</h2>
+        <p className="text-[12px] text-fg-subtle">
+          Live counters, reset on every restart and shared by every workspace on this
+          instance.
+        </p>
+      </div>
 
       {metrics.loading ? (
         <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
