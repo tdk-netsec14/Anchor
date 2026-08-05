@@ -9,16 +9,20 @@ LLM provider, lets the model call internal tools, validates the answer on the wa
 out, and records everything it does in structured logs and metrics. An automated
 evaluation suite catches quality regressions.
 
-It runs on a single machine with `docker compose up`, and works with **zero API
-keys** using a local Ollama model. It ships with a **Next.js web application**
-(landing page, authenticated assistant, knowledge base, activity, analytics and
-settings) alongside the API's own zero-build demo page.
+It is a **multi-tenant SaaS application**: users and workspaces, per-workspace
+documents, conversations, API keys, analytics and audit trails, with
+Argon2id passwords, rotating refresh tokens, RBAC and a background ingestion
+worker. It runs on a single machine with `docker compose up` and works with
+**zero API keys** using a local Ollama model, and ships with a **Next.js web
+application** (landing page, dashboard, assistant, conversations, knowledge base,
+documents, activity, analytics, team and settings).
 
 ### Try it
 
 ```bash
-# 1. Backend — the API, on http://localhost:8000
+# 1. Backend — Postgres, migrations, the API and the ingestion worker
 docker compose up --build -d
+docker compose --profile local-llm up -d ollama
 docker exec anchor-ollama ollama pull llama3.2:3b
 
 # 2. Frontend — the web app, on http://localhost:3000
@@ -28,10 +32,12 @@ cp .env.example .env.local
 npm run dev
 ```
 
-Then open **<http://localhost:3000>**. Sign in as `Engineer` (read-only) or
-`Admin` (can ingest) and ask a question. The API itself is at
-[/docs](http://localhost:8000/docs) (Swagger), and [/ui](http://localhost:8000/ui)
-is the zero-build demo page.
+Then open **<http://localhost:3000>**, click **Sign up**, and create the first
+account — you become the owner of a new workspace. Upload a PDF from
+**Knowledge Base**, then ask a question in **Assistant**.
+
+The API itself is at [/docs](http://localhost:8000/docs) (Swagger), and
+[/ui](http://localhost:8000/ui) is the zero-build demo page.
 
 ---
 
@@ -41,6 +47,7 @@ is the zero-build demo page.
 - [Demo page](#demo-page)
 - [The web application](#the-web-application)
 - [Architecture](#architecture)
+- [Authentication and multi-tenancy](#authentication-and-multi-tenancy)
 - [Tech stack](#tech-stack)
 - [Setup](#setup)
 - [Environment variables](#environment-variables)
@@ -50,7 +57,7 @@ is the zero-build demo page.
 - [Testing](#testing)
 - [Deployment](#deployment)
 - [Production data](#production-data)
-- [Known simplifications](#known-simplifications)
+- [Known limitations](#known-limitations)
 - [Engineering decisions](#engineering-decisions)
 - [How to demonstrate Anchor](#how-to-demo-anchor)
 - [Project layout](#project-layout)
@@ -117,12 +124,17 @@ the product surface; the API is the engine behind it.
 frontend/
 ├── app/
 │   ├── page.tsx              # public landing page
-│   ├── login/                # sign-in
+│   ├── login/                # sign in with email + password
+│   ├── signup/               # create an account and its first workspace
 │   ├── (app)/                # everything behind the session gate
+│   │   ├── dashboard/        # workspace overview from /analytics/overview
 │   │   ├── assistant/        # the primary screen
+│   │   ├── conversations/    # saved threads, with sources and cost
 │   │   ├── knowledge/        # document list + ingestion
+│   │   ├── documents/        # ingestion pipeline state; failures and re-index
 │   │   ├── activity/         # recent requests
-│   │   ├── analytics/        # metrics from /metrics
+│   │   ├── analytics/        # process-level metrics
+│   │   ├── team/             # members, invitations, API keys
 │   │   └── settings/         # safe runtime configuration
 │   └── api/                  # Next.js route handlers (see below)
 ├── components/               # layout, landing, assistant, knowledge, analytics, ui
@@ -133,28 +145,40 @@ frontend/
 
 ### How the browser reaches the backend
 
-The browser never calls FastAPI directly. Three route handlers sit in between:
+The browser never calls FastAPI directly. Route handlers sit in between:
 
 | Route | Purpose |
 |---|---|
-| `POST /api/auth/login` | Exchanges username + role for a JWT and sets it as an **httpOnly** cookie |
-| `GET /api/auth/session` | Returns the principal (never the token) |
-| `POST /api/auth/logout` | Clears the cookie |
+| `POST /api/auth/login` | Exchanges email + password for a session and sets **httpOnly** cookies |
+| `POST /api/auth/register` | Creates an account and its first workspace |
+| `GET /api/auth/session` | Returns the principal (never a token) |
+| `POST /api/auth/logout` | Revokes the refresh token, then clears the cookies |
+| `POST /api/auth/refresh` | Trades the refresh token for a new access token |
 | `ALL /api/backend/[...path]` | Reverse proxy that attaches the bearer token server-side |
 
-Two consequences worth stating plainly:
+Three cookies back the session:
 
-- **The access token is never in `localStorage` and never in the client
-  bundle.** It is `httpOnly`, so injected script cannot read it, and it is
-  attached to the backend call by the server. The browser only ever learns the
-  principal's username and role.
+| Cookie | Contents | Scope |
+|---|---|---|
+| `anchor_session` | Access token | `/`, httpOnly |
+| `anchor_refresh` | Refresh token (single-use) | `/api/auth` only, httpOnly |
+| `anchor_profile` | Name, email, workspace, role — display only | `/`, httpOnly |
+
+Consequences worth stating plainly:
+
+- **No token is ever in `localStorage` or the client bundle.** All three are
+  `httpOnly`, so injected script cannot read them. The refresh token is scoped
+  to `/api/auth` so that only the handlers above can present it.
+- **An expired access token is not a logout.** When FastAPI rejects a call the
+  proxy redeems the refresh token once and replays the request, so a tab left
+  open keeps working. A 401 the refresh cannot fix clears the session.
 - **Production needs no CORS grant on the API**, because the browser talks only
   to Vercel. Vercel talks to Render over HTTPS. `CORS_ALLOWED_ORIGINS` can
   therefore be left empty in that topology.
 
 The proxy is *not* an authorisation layer. It carries a credential; FastAPI
-still verifies the JWT and enforces the `admin` role on every route, so the UI
-cannot widen its own permissions.
+verifies the JWT, re-reads the caller's membership, and enforces the workspace
+role on every route, so the UI cannot widen its own permissions.
 
 ### Design decisions
 
@@ -165,6 +189,10 @@ cannot widen its own permissions.
 - **Typed contracts.** `types/api.ts` mirrors the Pydantic models. A field the
   backend does not send is typed optional, so the UI degrades honestly instead
   of rendering a confident blank.
+- **Workspace roles, not a global role.** The UI compares
+  `owner > admin > member > viewer` to decide what to enable, but every one of
+  those actions is re-checked by the backend, so hiding a control is a
+  courtesy rather than the control.
 - **The charts are hand-rolled SVG/CSS**, not a charting dependency — there are
   four of them and a library would outweigh them. Their data-mark colours were
   validated for lightness band, chroma, colour-vision-deficiency separation and
@@ -244,6 +272,86 @@ Full detail, including the reasoning behind each choice, is in
 
 ---
 
+## Authentication and multi-tenancy
+
+### Accounts
+
+There are two credential kinds, and they are not interchangeable.
+
+**A real session** is the product path. Registering creates a user *and* a
+workspace, with the user as its OWNER. The password is hashed with
+**Argon2id** (RFC 9106 second-recommended parameters, read from configuration
+so they can be raised later without invalidating existing credentials) and a
+server-side `CREDENTIAL_PEPPER` is mixed in. The pepper is a real secret:
+without it, a stolen hash is only as protected as Argon2 alone.
+
+`POST /auth/login` returns an access token and a **refresh token**. The refresh
+token is single-use; redeeming it mints a new pair, and presenting one that was
+already redeemed is treated as theft — every session for that user is revoked
+and the request is refused. That turns "I copied your refresh token" from a
+permanent silent compromise into something visible and recoverable.
+
+`POST /auth/logout` revokes the refresh token server-side. Sessions are
+therefore revocable; the access token remains stateless and valid until it
+expires, which is why it is deliberately short-lived.
+
+**A demo token** (`POST /auth/token`, or `python -m agent.auth`) is the original
+development shortcut: a username and a self-selected role, with no password
+check. It is refused outright when `ENVIRONMENT=prod`, and the tokens it mints
+name no workspace, so every tenant-scoped route rejects them anyway. It is not
+a login path and is not reachable on a real deployment.
+
+### Workspaces, roles and isolation
+
+A request only ever acts inside one workspace, and **the workspace comes from
+the credential** — never from the request body, a URL parameter, or a header
+the client chooses.
+
+```
+User ──▶ Membership ──▶ Workspace ──┬──▶ Documents      (+ vector chunks)
+  │                                 ├──▶ Conversations  (+ messages)
+  │                                 ├──▶ API keys
+  │                                 ├──▶ QueryUsage    (analytics)
+  │                                 └──▶ Audit events
+  └──▶ Refresh tokens / password-reset tokens
+```
+
+Roles are ordered, and the backend compares ranks so a new role slots in
+without touching a check:
+
+| Role | Can |
+|---|---|
+| `OWNER` | Everything an admin can, plus transferring ownership. Cannot be demoted by themselves. |
+| `ADMIN` | Manage documents, members, invitations and API keys. |
+| `MEMBER` | Ask questions, read documents, use their own conversations. |
+| `VIEWER` | Read-only. |
+
+Three rules do the real work:
+
+- **Scoping is in the query.** Every tenant-owned row is fetched through
+  `agent/db/access.py::scoped_one`, which puts the caller's workspace in the
+  `WHERE` clause. The same predicate in six places would be six chances to
+  write it once; here there is one.
+- **Cross-tenant access is 404, not 403.** A 403 would confirm that a guessed
+  id is real somewhere, which is itself a leak.
+- **A valid signature is not a live permission.** Membership is re-read from
+  the database on every authenticated request, so removing someone takes
+  effect immediately rather than at token expiry. A role change tells them to
+  sign in again rather than continuing with stale claims.
+
+Tools are held to the same rule: any tool that reads tenant data declares
+`requires_workspace`, and the registry refuses the call — as a recorded tool
+error the model can recover from, not an exception — when the context carries
+none. Retrieval fails closed the same way: with a database configured, an
+unscoped search raises rather than reading across tenants.
+
+`tests/integration/test_tenancy.py` is written adversarially for this reason:
+every test creates a second workspace first and then attacks the first one from
+it, because a route that forgets its `WHERE workspace_id = ...` still works
+perfectly for the single tenant a developer is testing as.
+
+---
+
 ## Tech stack
 
 | Layer | Technology | Why this one |
@@ -287,18 +395,33 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 docker compose up --build -d
 ```
 
-The first start pulls the Ollama image and the embedding model, so give it a
-few minutes. Then pull a chat model:
+This brings up **PostgreSQL, a one-shot migration, the API and the ingestion
+worker**. A database is part of the stack because Anchor is multi-tenant:
+without one there are no workspaces, no ownership, and the persistence-backed
+endpoints answer 503 rather than pretending to work.
+
+Ollama is opt-in, because a local model is a development convenience rather
+than part of the production architecture:
 
 ```bash
+docker compose --profile local-llm up -d ollama
 docker exec anchor-ollama ollama pull llama3.2:3b
 ```
 
-`docker compose up` starts `ollama` and `agent`. The batch ingestion worker is
-opt-in so it stays out of the way:
+Batch-ingesting a folder of PDFs is a separate, opt-in service too:
 
 ```bash
 docker compose --profile batch run --rm ingestion   # ingest data/documents/
+```
+
+Once the stack is up, create the first account — the UI needs one, because
+there is no seeded user:
+
+```bash
+# or just open http://localhost:3000 and use "Sign up"
+curl -sS -X POST http://localhost:8000/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"a-long-passphrase","workspace_name":"Acme"}'
 ```
 
 ### Option B — Local Python
@@ -308,8 +431,12 @@ py -3.11 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\a
 pip install -r requirements-dev.txt
 cp .env.example .env      # set JWT_SECRET
 
-# Start Ollama separately, then:
+# Apply the schema (Anchor never creates tables at startup):
+python -m alembic upgrade head
+
 python -m uvicorn agent.main:app --reload
+# and, in a second terminal, the background ingestion worker:
+python -m agent.worker
 ```
 
 **OCR on Windows:** the Tesseract installer does not add itself to `PATH`. After
@@ -431,26 +558,56 @@ docker compose down -v           # stop and delete the vector store
 
 ### 1. Get a token
 
+Register (or sign in) to get a real session:
+
 ```bash
-curl -X POST http://localhost:8000/auth/token \
+curl -X POST http://localhost:8000/auth/register \
   -H "Content-Type: application/json" \
-  -d '{"username": "alice", "role": "user"}'
+  -d '{"email": "alice@example.com", "password": "a-long-passphrase",
+       "full_name": "Alice", "workspace_name": "Acme"}'
 ```
 
 ```json
 {
   "access_token": "eyJhbGciOiJIUzI1NiIs...",
+  "refresh_token": "3d1f…",
   "token_type": "bearer",
   "expires_in": 3600,
-  "role": "user"
+  "user_id": "…",
+  "email": "alice@example.com",
+  "workspace_id": "…",
+  "workspace_name": "Acme",
+  "workspace_role": "owner"
 }
 ```
 
-Swap `"role": "user"` for `"admin"` to get a token that can ingest documents.
+`POST /auth/login` takes just `email` and `password` and returns the same
+shape. A wrong address and a wrong password produce the same response, so the
+endpoint cannot be used to enumerate accounts.
 
 ```bash
 export TOKEN="<paste access_token>"
 ```
+
+The registering user is the workspace **OWNER**, which is why they can ingest
+and manage members without anyone granting it.
+
+<details>
+<summary>Development shortcut (no password, no workspace)</summary>
+
+`POST /auth/token` mints a token from a username and a self-selected role. It
+exists for the agent loop and the zero-build demo page, it is refused when
+`ENVIRONMENT=prod`, and because it names no workspace **every tenant-scoped
+route rejects it anyway** — so it is not a way into the product.
+
+```bash
+curl -X POST http://localhost:8000/auth/token \
+  -H "Content-Type: application/json" -d '{"username": "alice", "role": "user"}'
+```
+
+The same thing from the shell: `make token`, or `python -m agent.auth <user> <role>`.
+
+</details>
 
 ### 2. Ingest a document (admin only)
 
@@ -716,7 +873,7 @@ regression.
 ```bash
 pytest                       # tests/ — the default testpath
 pytest tests/unit            # fast, no I/O
-pytest tests/integration     # agent loop, driven by scripted providers
+pytest tests/integration     # agent loop, HTTP surface, tenant isolation
 pytest tests/security        # adversarial: injection, PII, calculator, RBAC
 pytest eval/                 # graders + live evaluation regressions
 ruff check .                 # static checks
@@ -731,6 +888,39 @@ agent loop — retrieval → prompt → tool loop → guardrails → response �
 exercised deterministically in CI without a running Ollama. The real providers
 are verified separately by running the service, and the tool-calling path is
 covered against a live model in the evaluation suite.
+
+| Suite | What it covers |
+|---|---|
+| `tests/unit` | Chunking, config, health, providers, the router, tool parsing and the registry. |
+| `tests/integration/test_agent_loop.py` | The full loop against scripted providers, including tool failures and iteration budgets. |
+| `tests/integration/test_api.py` | The HTTP contract: auth, RBAC, guardrails, CORS, error shapes. |
+| `tests/integration/test_ingestion.py` | Extraction, OCR, chunking, vector storage, re-ingest semantics. |
+| `tests/integration/test_tenancy.py` | **Adversarial tenant isolation** — a second workspace attacking the first across documents, conversations, members, API keys and analytics. |
+| `tests/security` | Prompt injection, PII redaction, the calculator sandbox. |
+| `eval` | Four graders over 20 cases, plus live evaluation regressions. |
+
+The persistence tests run against in-memory SQLite. The migration round-trip
+(`upgrade → check → downgrade → upgrade`) runs against **real PostgreSQL** in
+CI, because a schema that only works on SQLite is not a schema.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request, and deploys
+nothing:
+
+| Job | Checks |
+|---|---|
+| `backend` | ruff, mypy, `pytest tests`, `pytest eval` |
+| `frontend` | `next lint`, `tsc --noEmit`, `next build` |
+| `migrations` | `alembic upgrade` / `check` / `downgrade` / `upgrade` against PostgreSQL 16 |
+| `docker` | Builds `agent/Dockerfile` |
+| `security` | `pip-audit`, `npm audit`, gitleaks over the full history |
+| `production-config` | Asserts that a prod deployment with no database **refuses to start** |
+
+The last one matters: the production config validator is a security control,
+and a test that merely imported it would pass forever after someone deleted the
+body. The job runs it and fails if an unconfigured deployment is allowed to
+boot.
 
 ### Checking the deployed service
 
@@ -787,13 +977,37 @@ with a higher limit. This is a real constraint, not a theoretical one.
 `render.yaml` is a Render blueprint:
 
 ```bash
-render blueprint launch          # or create the service from the dashboard
+render blueprint launch          # or create the services from the dashboard
 ```
 
-It builds `agent/Dockerfile`, exposes `/health` as the health check, and
-**attaches a 1 GB disk mounted at `/var/data`**. Set `JWT_SECRET` and at least
-one provider key in the dashboard; the blueprint leaves them unset rather than
-committing them.
+It creates **two services and a database**:
+
+| Service | Type | Role |
+|---|---|---|
+| `anchor-agent` | web | The API. Health check `/health`, `preDeployCommand: alembic upgrade head`. |
+| `anchor-ingestion-worker` | worker | Runs `python -m agent.worker`. Extraction, OCR, embedding and indexing. |
+| `anchor-db` | database | Managed PostgreSQL, wired into both services. |
+| `anchor-chroma` | disk | 1 GB mounted at `/var/data`, holding the vector store. |
+
+Both services share a 1 GB disk mounted at `/var/data`; the worker must write
+to the **same** Chroma directory the API reads, or indexed chunks never appear.
+
+Set these in the dashboard — the blueprint leaves every secret unset rather
+than committing it:
+
+| Variable | Required | Notes |
+|---|---|---|
+| `JWT_SECRET` | yes | Generated by the blueprint. At least 32 characters. |
+| `CREDENTIAL_PEPPER` | yes | Generated. Rotating it invalidates every stored password. |
+| `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | yes | See [Production data](#production-data). |
+| `GROQ_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` | one of | At least one, or `/query` returns `no_provider_available`. |
+
+**Anchor refuses to start in production** if the database is missing, if
+storage is not S3, if the pepper is empty, if `JWT_SECRET` is under 32
+characters, or if CORS is `*`. A half-configured deploy fails at boot with a
+list of what is missing, rather than serving traffic and failing later. This
+is deliberate: a process that boots and then behaves insecurely is worse than
+one that refuses to start, because the deploy looks successful.
 
 You do not need Ollama in production — Render cannot run a local model
 alongside the service, and `ROUTER_DEFAULT_MODEL` should point at a hosted
@@ -803,6 +1017,20 @@ provider. Ollama remains the development path via `docker compose`.
 
 Leave `CORS_ALLOWED_ORIGINS` **empty**. No browser origin reaches the API
 directly, because the Vercel route handler proxies every call server-side.
+
+### Running the worker elsewhere
+
+The worker is an ordinary process and is not Render-specific:
+
+```bash
+python -m agent.worker            # poll loop, CTRL-C to stop
+```
+
+Point it at the same `DATABASE_URL`, the same `STORAGE_BACKEND` and the same
+`CHROMA_PERSIST_DIR` as the API, or it will claim jobs it cannot see the
+results of. Several workers can run at once: a job is claimed with a
+conditional `UPDATE`, so only the transaction that actually changes a row goes
+on to process it.
 
 ---
 
@@ -834,22 +1062,26 @@ can see what the running instance actually has.
 
 ---
 
-## Known simplifications
+## Known limitations
 
-These are deliberate scope decisions, not oversights. Each is stated so nobody
-mistakes a demo for a deployment.
+Stated plainly, so nobody mistakes this for a finished product. The first four
+are the ones that would bite first in a real deployment.
 
-| Simplification | What that means |
+| Limitation | What that means in practice |
 |---|---|
-| **Demo JWT issuance** | `POST /auth/token` mints a token from a username and role. No password check, no user database, no refresh tokens. Replace it with a real identity provider. |
+| **No workspace switching** | A session is bound to exactly one workspace, and `/auth/login` resolves to the account's first membership. A user who is invited to a second workspace **cannot obtain a working session for it** — accepting an invite returns workspace details, not a new session. Every tenant in practice has its own account, or the second workspace is unreachable through the UI. Closing this needs a `POST /auth/switch-workspace` that reissues a session for a chosen membership. |
+| **Password reset sends no email** | `/auth/forgot-password` always returns the same response (so it cannot enumerate accounts), but the token is only returned when `ENVIRONMENT != prod`. In production the endpoint returns `null` and there is no mail provider, so **the reset flow is not usable as deployed**. A deployment that needs it must deliver the link itself. |
+| **Rate limiting is process-local** | Counters live in the API process. Behind more than one instance the limit is per-instance rather than global. Sized as a backstop, not a quota. |
+| **No streaming responses** | `POST /query` returns a complete answer, not a token stream. Answers from a local CPU-hosted model can take a minute, during which the browser waits. |
 | **Heuristic prompt-injection detection** | Regex/keyword matching on known phrasings. **Not a security boundary** — bypassable by paraphrase, non-English text, or encoding tricks. The defences that actually hold are structural (§below). |
-| **In-memory metrics** | Counters live in the process and reset on restart, and are per-process. Prometheus/Grafana is future work. |
-| **Simulated ticket creation** | `create_ticket` writes a JSON file to `data/tickets/`. No ticketing system is contacted, and the tool description tells the model not to claim otherwise. |
-| **Local vector database** | ChromaDB in-process, one collection, no ACLs or per-user visibility. Persists to local disk — see [Production data](#production-data). |
-| **No horizontal scaling** | One Agent API process, one shared ChromaDB directory. |
-| **No token revocation** | JWTs are stateless. Signing out clears the httpOnly cookie in the browser, but the token itself stays valid until it expires. A stolen token cannot be invalidated before then; real deployments need a denylist or short-lived tokens plus refresh. |
-| **No SSR session gate** | Protected pages are gated client-side. The data behind them is not — FastAPI authorises every request independently — but the redirect happens after hydration, so the page shell can flash before the login redirect. |
-| **No Kubernetes** | Compose on a single machine is the deployment target. |
+| **In-memory process metrics** | `/metrics` counters reset on restart and are per-process. The durable, per-workspace numbers the product shows are on `/analytics/*`, computed from recorded rows instead. Prometheus/Grafana is future work. |
+| **Simulated ticket creation** | `create_ticket` writes a JSON file to `TICKETS_DIR`. No ticketing system is contacted, and the tool description tells the model not to claim otherwise. |
+| **Local vector database** | ChromaDB in-process, one collection. Tenant filtering is enforced on every query and deletion, but there are no vector-store ACLs. Persists to local disk or a mounted volume — see [Production data](#production-data). |
+| **No horizontal scaling of the API** | One API process and one shared ChromaDB directory. The ingestion worker *does* scale — jobs are claimed with a conditional UPDATE — but the API itself does not. |
+| **Client-side session gate** | There is no Next.js `middleware.ts`, so protected pages gate in the browser and the shell can flash before the redirect. The data behind them is not exposed: FastAPI authorises every request independently. |
+| **Cost is zero unless configured** | No price is hardcoded. `COST_INPUT_PER_MTOK` / `COST_OUTPUT_PER_MTOK` must be filled in per `provider/model` or spend is reported as `0.0` — deliberately, rather than guessing. |
+| **Tests run on SQLite** | The suite uses in-memory SQLite. The migration round-trip and the same tenant predicates are verified against real PostgreSQL in CI and were exercised by hand against PostgreSQL 16. |
+| **No Kubernetes** | Compose on a single machine is the local deployment target. |
 
 ### What the security model actually rests on
 
@@ -862,6 +1094,15 @@ regardless of whether an attack is detected:
   poisoned document cannot pose as an instruction;
 - the model can only call three **allow-listed** tools, and every argument is
   schema-validated before execution;
+- a tool that reads tenant data declares `requires_workspace`, and the registry
+  refuses the call outright when the context carries none;
+- every tenant-owned row is fetched through a shared `scoped_one` helper that
+  puts the caller's workspace in the `WHERE` clause, and a row in another
+  workspace answers **404 rather than 403** — a 403 would confirm a guessed id
+  is real somewhere;
+- the workspace comes from the **credential**, never from the request body or
+  URL, and the membership is re-read from the database on every request so a
+  revoked permission takes effect immediately rather than at token expiry;
 - the calculator **parses** an AST against a whitelist — `eval` appears nowhere
   in the codebase;
 - output is checked for PII and for citations to sources that were never
@@ -1051,9 +1292,14 @@ walkthrough gives the underlying calls so you can show the API too.
 
 ### 2. Authenticate (30 s)
 
-Click **Get user token**, then **Get admin token**. Both appear in the token
-field. Note that these come from a token endpoint that issues tokens *without a
-password* — say that out loud, it is in the README under Known simplifications.
+Open **<http://localhost:3000>** and click **Sign up**. That creates an
+account *and* a workspace, with you as its OWNER — one step, and it shows the
+tenancy model doing its job.
+
+For the demo page at `/ui`, click **Get user token**, then **Get admin token**.
+Note out loud that those come from a development endpoint that issues tokens
+*without a password* and names no workspace — it is disabled in production and
+refused by every tenant-scoped route.
 
 ### 3. Show the RBAC boundary (30 s)
 
@@ -1066,8 +1312,15 @@ curl -i -X POST http://localhost:8000/ingest \
 # 403 insufficient_role
 ```
 
-This is the moment to say: *a normal user can never write to the shared
-knowledge base.* Then ingest with the admin token and show `chunks_created: 2`.
+This is the moment to say: *a viewer can never write to the shared knowledge
+base.* Then, in the web app, **Team** → invite someone as `viewer` and show
+that the ingest control is gone for them — and that calling the endpoint
+directly still returns 403, because the check is on the server.
+
+Then upload the PDF from **Knowledge Base**. The response says
+`status: "queued"`, not "indexed" — the API returns as soon as the bytes are
+stored and a background worker does the extraction, and **Documents** shows it
+move to `indexed` a moment later.
 
 ### 4. Ask a factual question (1 min)
 
@@ -1192,17 +1445,34 @@ python eval/run_eval.py --regrade-from eval/results/<timestamp>.json
 
 ```
 anchor/
-├── docker-compose.yml         # ollama + agent (+ opt-in ingestion worker)
+├── docker-compose.yml         # postgres + migrate + agent + worker (+ opt-in ollama)
 ├── Makefile                   # common tasks
 ├── .env.example               # every setting, documented
+├── alembic.ini, migrations/   # the schema; never created at startup
+├── .github/workflows/ci.yml   # lint, tests, migrations, docker, security
 │
 ├── agent/                     # SERVICE 2 — the API
-│   ├── main.py                # composition root, middleware, error handling
+│   ├── main.py                # composition root, middleware, prod config guard
 │   ├── config.py              # all configuration (pydantic-settings)
-│   ├── auth.py                # JWT + RBAC + POST /auth/token
 │   ├── agent.py               # the tool-calling loop
 │   ├── prompts.py             # system prompt (never exposed)
-│   ├── routers/               # query, ingest, metrics, health
+│   ├── worker.py              # SERVICE 3 — background ingestion worker
+│   ├── storage.py             # local + S3 object storage
+│   ├── rate_limit.py          # per-principal limits
+│   ├── audit.py               # the audit trail
+│   ├── security.py            # Argon2id, token hashing
+│   ├── auth/
+│   │   ├── tokens.py          # JWT issuance and verification
+│   │   ├── principals.py      # resolving the caller; RBAC and tenant guards
+│   │   ├── service.py         # register, login, refresh, reset
+│   │   └── __main__.py        # `make token` — the dev-only token CLI
+│   ├── db/
+│   │   ├── models.py          # users, workspaces, memberships, documents, …
+│   │   ├── base.py            # engine, session factory, as_utc
+│   │   ├── access.py          # scoped_one — the tenant-isolation helper
+│   │   └── seed.py            # bootstrap admin / demo workspace
+│   ├── routers/               # auth, query, ingest, documents, conversations,
+│   │                          # workspaces, api_keys, analytics, metrics, health
 │   ├── rag/                   # retriever, vector-store facade
 │   ├── routing/
 │   │   ├── router.py          # classification, retry, fallback
@@ -1212,26 +1482,26 @@ anchor/
 │   ├── schemas/               # Pydantic contracts
 │   └── observability/         # JSON logging, metrics registry
 │
-├── ingestion/                 # SERVICE 1 — the pipeline
+├── ingestion/                 # SERVICE 1 — the pipeline (shared with the API)
 │   ├── main.py                # batch worker entry point
 │   ├── pipeline.py            # bytes -> searchable chunks
 │   ├── ocr.py                 # pypdf + Tesseract fallback
 │   ├── chunker.py             # offset-based, verbatim chunking
 │   ├── embedder.py            # local MiniLM embeddings
-│   └── vector_store.py        # ChromaDB persistence (shared)
+│   └── vector_store.py        # ChromaDB persistence, tenant filtering
 │
-├── eval/                      # SERVICE 3 — the harness
+├── eval/                      # SERVICE 4 — the harness
 │   ├── run_eval.py            # runner + aggregation
 │   ├── test_agent.py          # the same cases as pytest regressions
 │   ├── test_cases.json        # 20 fixed cases
 │   └── graders/               # schema, exact, semantic, llm_judge
 │
-├── tests/{unit,integration,security}/
-├── scripts/                   # sample-doc generator, HTTP smoke test
+├── tests/{unit,integration,security}/   # incl. integration/test_tenancy.py
+├── scripts/                   # sample-doc generator, HTTP smoke test, e2e audit
 ├── data/documents/            # sample knowledge base
-├── render.yaml                # Render blueprint (incl. the persistent disk)
+├── render.yaml                # Render blueprint: web + worker + database + disk
 ├── frontend/                  # the Next.js web application
-│   ├── app/                   # landing, login, (app)/* workspace, api/*
+│   ├── app/                   # landing, login, signup, (app)/*, api/*
 │   ├── components/            # ui, layout, landing, assistant, knowledge, analytics
 │   ├── hooks/                 # useAuth, useChat, useAsync
 │   ├── lib/                   # api-client, backend, session, format
