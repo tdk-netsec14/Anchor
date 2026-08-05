@@ -23,6 +23,10 @@ chroma_data/
 data/tickets/*.json
 eval/results/*.json
 
+# Uploaded documents when STORAGE_BACKEND=local. These are user content, not
+# source — production uses S3, and nothing here should ever be committed.
+data/uploads/
+
 # --- Model weights ---------------------------------------------------------
 models/
 
