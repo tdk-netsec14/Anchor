@@ -1,19 +1,44 @@
-# Anchor — single-machine deployment.
+# Anchor — single-machine development stack.
 #
 #   cp .env.example .env      # then set JWT_SECRET
 #   docker compose up --build
 #
-# `agent` and `ollama` start by default. The batch ingestion worker is behind a
-# compose profile so it stays opt-in:
-#   docker compose --profile batch run --rm ingestion
+# Brings up PostgreSQL, the API, the background ingestion worker and (behind a
+# profile) a local Ollama. A database is included because Anchor is
+# multi-tenant: without one there are no workspaces, no ownership, and the
+# persistence-backed endpoints report 503 rather than pretending to work.
+#
+#   docker compose --profile local-llm up -d ollama     # opt into local models
+#   docker compose --profile batch run --rm ingestion   # batch-ingest a folder
 
 name: anchor
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: anchor-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: anchor
+      POSTGRES_PASSWORD: anchor
+      POSTGRES_DB: anchor
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U anchor -d anchor"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   ollama:
     image: ollama/ollama:latest
     container_name: anchor-ollama
     restart: unless-stopped
+    # Ollama is a local-development provider only; it is not part of the
+    # production architecture, so it is opt-in.
+    profiles: ["local-llm"]
     ports:
       - "11434:11434"
     volumes:
@@ -25,6 +50,23 @@ services:
       retries: 10
       start_period: 20s
 
+  migrate:
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    container_name: anchor-migrate
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://anchor:anchor@postgres:5432/anchor
+    # One-shot: apply the schema, then exit. Anchor never creates tables at
+    # startup, so this has to happen before the API serves traffic.
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   agent:
     build:
       context: .
@@ -34,6 +76,7 @@ services:
     env_file:
       - .env
     environment:
+      DATABASE_URL: postgresql+psycopg://anchor:anchor@postgres:5432/anchor
       # Inside the compose network the provider lives on the `ollama` service.
       OLLAMA_BASE_URL: http://ollama:11434
       CHROMA_PERSIST_DIR: /app/chroma_data
@@ -44,8 +87,33 @@ services:
       - chroma_data:/app/chroma_data
       - ./data:/app/data
     depends_on:
-      ollama:
+      postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    container_name: anchor-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://anchor:anchor@postgres:5432/anchor
+      OLLAMA_BASE_URL: http://ollama:11434
+      CHROMA_PERSIST_DIR: /app/chroma_data
+      TICKETS_DIR: /app/data/tickets
+    command: ["python", "-m", "agent.worker"]
+    volumes:
+      # The same vector store as the API: the worker writes the chunks the
+      # API reads, so they must not be two separate volumes.
+      - chroma_data:/app/chroma_data
+      - ./data:/app/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
   ingestion:
     build:
@@ -62,5 +130,6 @@ services:
       - ./data:/app/data
 
 volumes:
+  postgres_data:
   chroma_data:
   ollama_models:

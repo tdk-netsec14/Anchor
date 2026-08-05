@@ -31,6 +31,13 @@ RUN pip install --extra-index-url https://download.pytorch.org/whl/cpu \
 COPY agent /app/agent
 COPY ingestion /app/ingestion
 
+# The schema is owned by Alembic, and a managed platform needs to be able to run
+# `alembic upgrade head` from inside the image (Render's preDeployCommand, a
+# release step, or a one-off shell). Shipping the migrations but not the
+# alembic config — or neither — leaves a deploy with no way to create a schema.
+COPY migrations /app/migrations
+COPY alembic.ini /app/alembic.ini
+
 RUN mkdir -p /app/chroma_data /app/data/tickets /app/models
 
 EXPOSE 8000

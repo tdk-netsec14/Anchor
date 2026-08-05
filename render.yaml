@@ -1,14 +1,22 @@
 # Render blueprint for the Anchor agent API.
 #
-#   1. Set JWT_SECRET and at least one provider key as environment variables
-#      either in the dashboard or with `render blueprint launch`.
-#   2. The disk below is REQUIRED, not optional: ChromaDB persists to the
-#      local filesystem, and Render's container filesystem is wiped on every
-#      deploy and restart. Without the disk, the knowledge base silently comes
-#      back empty after each release. See README "Production data" for the
-#      managed alternatives.
+#   1. Create the backing services first, or let the blueprint create them:
+#      a managed PostgreSQL database, an S3-compatible bucket, and a disk for
+#      the vector store.
+#   2. Set every `sync: false` variable in the dashboard. None are committed.
+#   3. Deploy. The pre-deploy command migrates the schema; the API refuses to
+#      boot if DATABASE_URL, object storage or the pepper is missing, so a
+#      half-configured deploy fails loudly instead of serving traffic.
 #
-# Values marked sync: false are intentionally unset — no secret is committed.
+# The frontend deploys separately to Vercel and talks to this service through
+# its own server-side proxy, so no browser origin reaches the API and CORS is
+# left disabled.
+
+databases:
+  - name: anchor-db
+    databaseName: anchor
+    user: anchor
+    plan: basic-256mb
 
 services:
   - type: web
@@ -18,9 +26,11 @@ services:
     dockerContext: .
     plan: starter
     healthCheckPath: /health
-    # Embeddings and the model weights download on first boot; the default
-    # deploy timeout is not enough on a cold image.
     autoDeploy: true
+    # Applies the schema before the new build starts serving. Anchor never
+    # creates tables at startup, so without this a fresh database has no
+    # schema and every request fails.
+    preDeployCommand: python -m alembic upgrade head
     disk:
       name: anchor-chroma
       mountPath: /var/data
@@ -39,15 +49,37 @@ services:
       - key: PORT
         value: "8000"
 
-      # --- Vector store: mounted on the disk above, not the container FS ---
+      # --- Required secrets (sync: false — no value is committed) ---
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CREDENTIAL_PEPPER
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: anchor-db
+          property: connectionString
+
+      # --- Object storage: a container filesystem is wiped on every deploy ---
+      - key: STORAGE_BACKEND
+        value: s3
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_REGION
+        value: us-east-1
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_KEY_PREFIX
+        value: anchor
+
+      # --- Vector store: on the disk above, not the container filesystem ---
       - key: CHROMA_PERSIST_DIR
         value: /var/data/chroma
       - key: TICKETS_DIR
         value: /var/data/tickets
 
-      # --- Required, set in the dashboard ---
-      - key: JWT_SECRET
-        sync: false
+      # --- Providers ---
       - key: GROQ_API_KEY
         sync: false
       - key: OPENAI_API_KEY
@@ -60,8 +92,64 @@ services:
         value: groq/llama-3.3-70b-versatile
       - key: ROUTER_FALLBACK_CHAIN
         value: groq,openai
+      - key: AUTH_ALLOW_DEMO_TOKENS
+        value: "false"
+      - key: AUTH_ALLOW_REGISTRATION
+        value: "true"
+
       # The frontend proxies through Vercel, so no browser origin reaches the
-      # API directly and CORS can stay off. Set this only if you also point a
+      # API directly and CORS stays off. Set this only if you also point a
       # browser at https://<service>.onrender.com.
       - key: CORS_ALLOWED_ORIGINS
         value: ""
+
+  - type: worker
+    name: anchor-ingestion-worker
+    runtime: docker
+    dockerfilePath: ./agent/Dockerfile
+    dockerContext: .
+    plan: starter
+    # Uploads return as soon as the bytes are stored; extraction, OCR,
+    # embedding and indexing happen here. Without this worker the API still
+    # accepts documents but nothing ever moves them past `queued`.
+    dockerCommand: python -m agent.worker
+    disk:
+      name: anchor-chroma
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHONPATH
+        value: /app
+      - key: ENVIRONMENT
+        value: prod
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_JSON
+        value: "true"
+      - key: CREDENTIAL_PEPPER
+        fromService:
+          type: web
+          name: anchor-agent
+          property: CREDENTIAL_PEPPER
+      - key: DATABASE_URL
+        fromDatabase:
+          name: anchor-db
+          property: connectionString
+      - key: STORAGE_BACKEND
+        value: s3
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_REGION
+        value: us-east-1
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_KEY_PREFIX
+        value: anchor
+      - key: CHROMA_PERSIST_DIR
+        value: /var/data/chroma
+      - key: TICKETS_DIR
+        value: /var/data/tickets
+      - key: GROQ_API_KEY
+        sync: false
